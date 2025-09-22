@@ -20,6 +20,7 @@ import (
 	"github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/file"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/source"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
+	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/model"
 	"github.com/gocraft/dbr/v2"
 	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
@@ -146,9 +147,11 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		user.POST("/sms/destroy", u.sendDestroyCode)               //获取注销账号短信验证码
 		user.PUT("/updatepassword", u.updatePwd)                   // 修改登录密码
 		user.POST("/web3publickey", u.uploadWeb3PublicKey)         // 上传web3公钥
+		user.POST("/quit", u.quit)                                 // 退出登录
 		// #################### 登录设备管理 ####################
 		user.GET("/devices", u.deviceList)                 // 用户登录设备
 		user.DELETE("/devices/:device_id", u.deviceDelete) // 删除登录设备
+		user.GET("/devices/:device_id", u.getDevice)       // 查询某个登录设备
 		user.GET("/online", u.onlineList)                  // 用户在线列表（我的设备和我的好友）
 		user.POST("/online", u.onlinelistWithUIDs)         // 获取指定的uid在线状态
 		user.POST("/pc/quit", u.pcQuit)                    // 退出pc登录
@@ -201,6 +204,32 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 	u.ctx.AddOnlineStatusListener(u.handleOnlineStatus)               // 需要放在listenOnlineStatus之后
 	u.ctx.Schedule(time.Minute*5, u.onlineStatusCheck)                // 在线状态定时检查
 
+}
+
+// app退出登录
+func (u *User) quit(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+	err := u.ctx.QuitUserDevice(loginUID, int(config.Web)) // 退出web
+	if err != nil {
+		u.Error("退出web设备失败", zap.Error(err))
+		c.ResponseError(errors.New("退出web设备失败"))
+		return
+	}
+
+	err = u.ctx.QuitUserDevice(loginUID, int(config.PC))
+	if err != nil {
+		u.Error("退出PC设备失败", zap.Error(err))
+		c.ResponseError(errors.New("退出PC设备失败"))
+		return
+	}
+
+	err = u.ctx.GetRedisConn().Del(fmt.Sprintf("%s%s", u.userDeviceTokenPrefix, loginUID))
+	if err != nil {
+		u.Error("删除设备token失败！", zap.Error(err))
+		c.ResponseError(errors.New("删除设备token失败！"))
+		return
+	}
+	c.ResponseOK()
 }
 
 // 清除红点
@@ -556,7 +585,12 @@ func (u *User) userUpdateWithField(c *wkhttp.Context) {
 				return
 			}
 
-			tx, _ := u.db.session.Begin()
+			tx, err := u.db.session.Begin()
+			if err != nil {
+				u.Error("创建事务失败！", zap.Error(err))
+				c.ResponseError(errors.New("创建事务失败！"))
+				return
+			}
 			defer func() {
 				if err := recover(); err != nil {
 					tx.Rollback()
@@ -622,8 +656,6 @@ func (u *User) userUpdateWithField(c *wkhttp.Context) {
 		}
 		err = u.ctx.SendCMD(config.MsgCMDReq{
 			CMD:         common.CMDChannelUpdate,
-			ChannelID:   loginUID,
-			ChannelType: common.ChannelTypePerson.Uint8(),
 			Subscribers: uids,
 			Param: map[string]interface{}{
 				"channel_id":   loginUID,
@@ -659,7 +691,6 @@ func (u *User) userUpdateSetting(c *wkhttp.Context) {
 		c.ResponseError(errors.New("用户信息不存在！"))
 		return
 	}
-
 	for key, value := range reqMap {
 		if key == "device_lock" ||
 			key == "search_by_phone" ||
@@ -670,15 +701,22 @@ func (u *User) userUpdateSetting(c *wkhttp.Context) {
 			key == "voice_on" ||
 			key == "shock_on" ||
 			key == "mute_of_app" {
+			if key == "device_lock" && fmt.Sprintf("%v", value) == "1" {
+				if users.Phone == "15900000002" || users.Phone == "15900000003" || users.Phone == "15900000004" || users.Phone == "15900000005" || users.Phone == "15900000006" {
+					c.ResponseError(errors.New("演示账号不支持开启设备锁"))
+					return
+				}
+
+			}
 			err = u.db.UpdateUsersWithField(key, fmt.Sprintf("%v", value), loginUID)
 			if err != nil {
 				u.Error("修改用户资料失败", zap.Error(err))
 				c.ResponseError(errors.New("修改用户资料失败"))
 				return
 			}
-			c.ResponseOK()
 		}
 	}
+	c.ResponseOK()
 }
 
 // 获取用户详情
@@ -705,17 +743,48 @@ func (u *User) get(c *wkhttp.Context) {
 	}
 	isShowShortNo := false
 	vercode := ""
+	var groupMember *model.GroupMemberResp
 	if groupNo != "" {
 		modules := register.GetModules(u.ctx)
 		for _, m := range modules {
-			if m.BussDataSource.IsShowShortNo != nil {
+			if m.BussDataSource.IsShowShortNo != nil && vercode == "" {
 				tempShowShortNo, tempVercode, _ := m.BussDataSource.IsShowShortNo(groupNo, uid, loginUID)
 				if tempShowShortNo {
 					isShowShortNo = tempShowShortNo
 					vercode = tempVercode
-					break
 				}
 			}
+			if m.BussDataSource.GetGroupMember != nil && groupMember == nil {
+				groupMember, _ = m.BussDataSource.GetGroupMember(groupNo, uid)
+			}
+		}
+	}
+
+	if groupMember != nil && groupMember.InviteUID != "" && groupMember.IsDeleted == 0 {
+		inviteJoinGroupUserInfo, err := u.userService.GetUserDetail(groupMember.InviteUID, uid)
+		if err != nil {
+			u.Error("获取加入群聊邀请用户详情失败！", zap.Error(err))
+		}
+		if inviteJoinGroupUserInfo != nil {
+			var name = inviteJoinGroupUserInfo.Name
+			if inviteJoinGroupUserInfo.Remark != "" {
+				name = inviteJoinGroupUserInfo.Remark
+			}
+			userDetailResp.JoinGroupInviteUID = groupMember.InviteUID
+			userDetailResp.JoinGroupTime = groupMember.CreatedAt
+			userDetailResp.JoinGroupInviteName = name
+		}
+		userDetailResp.GroupMember = &GroupMemberResp{
+			UID:                groupMember.UID,
+			Name:               groupMember.Name,
+			GroupNo:            groupMember.GroupNo,
+			Remark:             groupMember.Remark,
+			Role:               groupMember.Role,
+			Status:             groupMember.Status,
+			InviteUID:          groupMember.InviteUID,
+			Robot:              groupMember.Role,
+			ForbiddenExpirTime: groupMember.ForbiddenExpirTime,
+			CreatedAt:          groupMember.CreatedAt,
 		}
 	}
 
@@ -834,7 +903,7 @@ func (u *User) wxLogin(c *wkhttp.Context) {
 		return
 	}
 	if userInfo != nil {
-		if userInfo == nil || userInfo.IsDestroy == 1 {
+		if userInfo.IsDestroy == 1 {
 			c.ResponseError(errors.New("用户不存在"))
 			return
 		}
@@ -874,7 +943,7 @@ func (u *User) wxLogin(c *wkhttp.Context) {
 				}
 			}
 		}
-		u.createUser(loginSpanCtx, model, c, "")
+		u.createUser(loginSpanCtx, model, c, nil)
 	}
 }
 
@@ -962,18 +1031,16 @@ func (u *User) execLogin(userInfo *Model, flag config.DeviceFlag, device *device
 		}
 		var existDevice bool
 		var err error
-		if device != nil {
-			existDevice, err = u.deviceDB.existDeviceWithDeviceIDAndUIDCtx(loginSpanCtx, device.DeviceID, userInfo.UID)
+		existDevice, err = u.deviceDB.existDeviceWithDeviceIDAndUIDCtx(loginSpanCtx, device.DeviceID, userInfo.UID)
+		if err != nil {
+			u.Error("查询是否存在的设备失败", zap.Error(err))
+			return nil, errors.New("查询是否存在的设备失败")
+		}
+		if existDevice {
+			err = u.deviceDB.updateDeviceLastLoginCtx(loginSpanCtx, time.Now().Unix(), device.DeviceID, userInfo.UID)
 			if err != nil {
-				u.Error("查询是否存在的设备失败", zap.Error(err))
-				return nil, errors.New("查询是否存在的设备失败")
-			}
-			if existDevice {
-				err = u.deviceDB.updateDeviceLastLoginCtx(loginSpanCtx, time.Now().Unix(), device.DeviceID, userInfo.UID)
-				if err != nil {
-					u.Error("更新用户登录设备失败", zap.Error(err))
-					return nil, errors.New("更新用户登录设备失败")
-				}
+				u.Error("更新用户登录设备失败", zap.Error(err))
+				return nil, errors.New("更新用户登录设备失败")
 			}
 		}
 		if !existDevice {
@@ -986,7 +1053,8 @@ func (u *User) execLogin(userInfo *Model, flag config.DeviceFlag, device *device
 		}
 	}
 	//更新最后一次登录设备信息
-	if flag == config.APP && device != nil {
+	// flag == config.APP &&
+	if device != nil {
 		err := u.deviceDB.insertOrUpdateDeviceCtx(loginSpanCtx, &deviceModel{
 			UID:         userInfo.UID,
 			DeviceID:    device.DeviceID,
@@ -998,6 +1066,7 @@ func (u *User) execLogin(userInfo *Model, flag config.DeviceFlag, device *device
 			u.Error("更新用户登录设备失败", zap.Error(err))
 			return nil, errors.New("更新用户登录设备失败")
 		}
+
 	}
 	token := util.GenerUUID()
 	// 将token设置到缓存
@@ -1120,7 +1189,7 @@ func (u *User) register(c *wkhttp.Context) {
 	}
 
 	if u.ctx.GetConfig().Register.Off {
-		c.ResponseError(errors.New("注册通道暂不开放"))
+		c.ResponseError(errors.New("注册通道暂不开放，请使用官网上演示账号登录"))
 		return
 	}
 	appConfig, err := u.commonService.GetAppConfig()
@@ -1133,6 +1202,7 @@ func (u *User) register(c *wkhttp.Context) {
 	if appConfig != nil {
 		registerInviteOn = appConfig.RegisterInviteOn
 	}
+	var invite *model.Invite
 	if registerInviteOn == 1 {
 		if req.InviteCode == "" {
 			c.ResponseError(errors.New("邀请码不能为空"))
@@ -1141,10 +1211,10 @@ func (u *User) register(c *wkhttp.Context) {
 		var inviteCodeIsExist = false
 		modules := register.GetModules(u.ctx)
 		for _, m := range modules {
-			if m.BussDataSource.RegisterInviteCodeIsExist != nil {
-				isExist, _ := m.BussDataSource.RegisterInviteCodeIsExist(req.InviteCode)
-				if isExist {
-					inviteCodeIsExist = isExist
+			if m.BussDataSource.GetInviteCode != nil {
+				invite, _ = m.BussDataSource.GetInviteCode(req.InviteCode)
+				if invite != nil && invite.Uid != "" {
+					inviteCodeIsExist = true
 					break
 				}
 			}
@@ -1198,7 +1268,7 @@ func (u *User) register(c *wkhttp.Context) {
 		Flag:     int(req.Flag),
 		Device:   req.Device,
 	}
-	u.createUser(registerSpanCtx, model, c, req.InviteCode)
+	u.createUser(registerSpanCtx, model, c, invite)
 }
 
 // 搜索用户
@@ -1230,7 +1300,7 @@ func (u *User) search(c *wkhttp.Context) {
 
 	if useModel.SearchByShort == 0 {
 		//关闭了短编号搜索
-		if keyword != useModel.ShortNo {
+		if strings.EqualFold(keyword, useModel.ShortNo) {
 			c.JSON(http.StatusOK, gin.H{
 				"exist": 0,
 			})
@@ -1321,6 +1391,9 @@ func (u *User) unregisterUserDeviceToken(c *wkhttp.Context) {
 // 获取登录的uuid（web登录）
 func (u *User) getLoginUUID(c *wkhttp.Context) {
 	uuid := util.GenerUUID()
+	deviceId := c.Query("device_id")
+	deviceName := c.Query("device_name")
+	deviceModel := c.Query("device_model")
 	err := u.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", common.QRCodeCachePrefix, uuid), util.ToJson(common.NewQRCodeModel(common.QRCodeTypeScanLogin, map[string]interface{}{
 		"app_id":  "wukongchat",
 		"status":  common.ScanLoginStatusWaitScan,
@@ -1330,6 +1403,19 @@ func (u *User) getLoginUUID(c *wkhttp.Context) {
 		u.Error("设置登录uuid失败！", zap.Error(err))
 		c.ResponseError(errors.New("设置登录uuid失败！"))
 		return
+	}
+	// 缓存设备信息
+	if deviceId != "" && deviceName != "" && deviceModel != "" {
+		err := u.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", common.DeviceCacheUUIDPrefix, uuid), util.ToJson(map[string]interface{}{
+			"device_id":    deviceId,
+			"device_name":  deviceName,
+			"device_model": deviceModel,
+		}), time.Minute*2)
+		if err != nil {
+			u.Error("设置登录设备信息失败！", zap.Error(err))
+			c.ResponseError(errors.New("设置登录设备信息失败！"))
+			return
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"uuid":   uuid,
@@ -1433,7 +1519,49 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 		c.ResponseError(errors.New("用户不存在！"))
 		return
 	}
-
+	// 获取缓存设备
+	uuid := authInfoMap["uuid"].(string)
+	if uuid != "" {
+		deviceCache, err := u.ctx.GetRedisConn().GetString(fmt.Sprintf("%s%s", common.DeviceCacheUUIDPrefix, uuid))
+		if err != nil {
+			u.Error("获取登录设备信息失败！", zap.Error(err))
+			c.ResponseError(errors.New("获取登录设备信息失败！"))
+			return
+		}
+		if deviceCache != "" {
+			var deviceInfoMap map[string]interface{}
+			err = util.ReadJsonByByte([]byte(deviceCache), &deviceInfoMap)
+			if err != nil {
+				u.Error("解码设备信息失败！", zap.Error(err))
+				c.ResponseError(errors.New("解码设备信息失败！"))
+				return
+			}
+			deviceId := deviceInfoMap["device_id"].(string)
+			deviceName := deviceInfoMap["device_name"].(string)
+			dmodel := deviceInfoMap["device_model"].(string)
+			if deviceId != "" && deviceName != "" && dmodel != "" {
+				span := u.ctx.Tracer().StartSpan(
+					"user.authCodeLogin",
+					opentracing.ChildOf(c.GetSpanContext()),
+				)
+				defer span.Finish()
+				spanCtx := u.ctx.Tracer().ContextWithSpan(context.Background(), span)
+				// 更新设备信息
+				err := u.deviceDB.insertOrUpdateDeviceCtx(spanCtx, &deviceModel{
+					UID:         userModel.UID,
+					DeviceID:    deviceId,
+					DeviceName:  deviceName,
+					DeviceModel: dmodel,
+					LastLogin:   time.Now().Unix(),
+				})
+				if err != nil {
+					u.Error("更新用户登录设备失败", zap.Error(err))
+					c.ResponseError(errors.New("更新用户登录设备失败"))
+					return
+				}
+			}
+		}
+	}
 	imResp, err := u.ctx.UpdateIMToken(config.UpdateIMTokenReq{
 		UID:         scaner,
 		Token:       token,
@@ -1608,7 +1736,12 @@ func (u *User) addBlacklist(c *wkhttp.Context) {
 	//添加黑名单
 	version := u.ctx.GenSeq(common.UserSettingSeqKey)
 	friendVersion := u.ctx.GenSeq(common.FriendSeqKey)
-	tx, _ := u.ctx.DB().Begin()
+	tx, err := u.ctx.DB().Begin()
+	if err != nil {
+		u.Error("开启事务失败！", zap.Error(err))
+		c.ResponseError(errors.New("开启事务失败！"))
+		return
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
@@ -1675,14 +1808,19 @@ func (u *User) removeBlacklist(c *wkhttp.Context) {
 	version := u.ctx.GenSeq(common.UserSettingSeqKey)
 	friendVersion := u.ctx.GenSeq(common.FriendSeqKey)
 
-	tx, _ := u.ctx.DB().Begin()
+	tx, err := u.ctx.DB().Begin()
+	if err != nil {
+		u.Error("开启事务失败！", zap.Error(err))
+		c.ResponseError(errors.New("开启事务失败！"))
+		return
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
 			panic(err)
 		}
 	}()
-	err := u.db.AddOrRemoveBlacklistTx(loginUID, uid, 0, version, tx)
+	err = u.db.AddOrRemoveBlacklistTx(loginUID, uid, 0, version, tx)
 	if err != nil {
 		tx.Rollback()
 		u.Error("移除黑名单失败！", zap.Error(err))
@@ -2122,12 +2260,22 @@ func (u *User) destroyAccount(c *wkhttp.Context) {
 		c.ResponseError(errors.New("登录用户不存在"))
 		return
 	}
-	// 校验验证码
-	err = u.smsServie.Verify(c.Context, userInfo.Zone, userInfo.Phone, code, commonapi.CodeTypeDestroyAccount)
-	if err != nil {
-		c.ResponseError(err)
-		return
+	//测试模式
+	if strings.TrimSpace(u.ctx.GetConfig().SMSCode) != "" {
+		if strings.TrimSpace(u.ctx.GetConfig().SMSCode) != code {
+			c.ResponseError(errors.New("验证码错误"))
+			return
+		}
+	} else {
+		//线上验证短信验证码
+		// 校验验证码
+		err = u.smsServie.Verify(c.Context, userInfo.Zone, userInfo.Phone, code, commonapi.CodeTypeDestroyAccount)
+		if err != nil {
+			c.ResponseError(err)
+			return
+		}
 	}
+
 	t := time.Now()
 	time := fmt.Sprintf("%d%d%d%d%d", t.Year(), t.Month(), t.Day(), t.Minute(), t.Second())
 	phone := fmt.Sprintf("%s@%s@delete", userInfo.Phone, time)
@@ -2186,7 +2334,11 @@ func (u *User) addSystemFriend(uid string) error {
 		u.Error("查询用户关系失败")
 		return err
 	}
-	tx, _ := u.friendDB.session.Begin()
+	tx, err := u.friendDB.session.Begin()
+	if err != nil {
+		u.Error("创建数据库事物失败")
+		return errors.New("创建数据库事物失败")
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
@@ -2344,8 +2496,13 @@ func allowUpdateUserField(field string) bool {
 	return false
 }
 
-func (u *User) createUser(registerSpanCtx context.Context, createUser *createUserModel, c *wkhttp.Context, inviteCode string) {
-	tx, _ := u.db.session.Begin()
+func (u *User) createUser(registerSpanCtx context.Context, createUser *createUserModel, c *wkhttp.Context, invite *model.Invite) {
+	tx, err := u.db.session.Begin()
+	if err != nil {
+		u.Error("创建数据库事物失败", zap.Error(err))
+		c.ResponseError(errors.New("创建数据库事物失败"))
+		return
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
@@ -2353,7 +2510,7 @@ func (u *User) createUser(registerSpanCtx context.Context, createUser *createUse
 		}
 	}()
 	publicIP := util.GetClientPublicIP(c.Request)
-	resp, err := u.createUserWithRespAndTx(registerSpanCtx, createUser, publicIP, inviteCode, tx, func() error {
+	resp, err := u.createUserWithRespAndTx(registerSpanCtx, createUser, publicIP, invite, tx, func() error {
 		err := tx.Commit()
 		if err != nil {
 			tx.Rollback()
@@ -2371,9 +2528,9 @@ func (u *User) createUser(registerSpanCtx context.Context, createUser *createUse
 	c.Response(resp)
 }
 
-func (u *User) createUserTx(registerSpanCtx context.Context, createUser *createUserModel, c *wkhttp.Context, commitCallback func() error, inviteCode string, tx *dbr.Tx) {
+func (u *User) createUserTx(registerSpanCtx context.Context, createUser *createUserModel, c *wkhttp.Context, commitCallback func() error, invite *model.Invite, tx *dbr.Tx) {
 	publicIP := util.GetClientPublicIP(c.Request)
-	resp, err := u.createUserWithRespAndTx(registerSpanCtx, createUser, publicIP, inviteCode, tx, commitCallback)
+	resp, err := u.createUserWithRespAndTx(registerSpanCtx, createUser, publicIP, invite, tx, commitCallback)
 	if err != nil {
 		c.ResponseError(errors.New("注册失败！"))
 		return
@@ -2381,7 +2538,7 @@ func (u *User) createUserTx(registerSpanCtx context.Context, createUser *createU
 	c.Response(resp)
 }
 
-func (u *User) createUserWithRespAndTx(registerSpanCtx context.Context, createUser *createUserModel, publicIP string, inviteCode string, tx *dbr.Tx, commitCallback func() error) (*loginUserDetailResp, error) {
+func (u *User) createUserWithRespAndTx(registerSpanCtx context.Context, createUser *createUserModel, publicIP string, invite *model.Invite, tx *dbr.Tx, commitCallback func() error) (*loginUserDetailResp, error) {
 	var (
 		shortNo = ""
 		err     error
@@ -2441,7 +2598,6 @@ func (u *User) createUserWithRespAndTx(registerSpanCtx context.Context, createUs
 	userModel.WXUnionid = createUser.WXUnionid
 	userModel.GiteeUID = createUser.GiteeUID
 	userModel.GithubUID = createUser.GithubUID
-
 	userModel.Status = int(common.UserAvailable)
 	err = u.db.insertTx(userModel, tx)
 	if err != nil {
@@ -2471,13 +2627,23 @@ func (u *User) createUserWithRespAndTx(registerSpanCtx context.Context, createUs
 		u.Error("添加注册用户和文件助手为好友关系失败", zap.Error(err))
 		return nil, err
 	}
+	inviteCode := ""
+	inviteUID := ""
+	vercode := ""
+	if invite != nil {
+		inviteCode = invite.InviteCode
+		inviteUID = invite.Uid
+		vercode = invite.Vercode
+	}
 	//发送用户注册事件
 	eventID, err := u.ctx.EventBegin(&wkevent.Data{
 		Event: event.EventUserRegister,
 		Type:  wkevent.Message,
 		Data: map[string]interface{}{
-			"uid":         createUser.UID,
-			"invite_code": inviteCode,
+			"uid":            createUser.UID,
+			"invite_code":    inviteCode,
+			"invite_uid":     inviteUID,
+			"invite_vercode": vercode,
 		},
 	}, tx)
 	if err != nil {

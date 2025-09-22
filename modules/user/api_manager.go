@@ -2,6 +2,7 @@ package user
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -61,6 +62,7 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		auth.GET("/user/admin", m.getAdminUsers)              // 查询管理员用户
 		auth.DELETE("/user/admin", m.deleteAdminUsers)        // 删除管理员用户
 		auth.POST("/user/add", m.addUser)                     // 添加一个用户
+		auth.POST("/user/resetpassword", m.resetUserPassword) // 重置用户密码
 		auth.GET("/user/list", m.list)                        // 用户列表
 		auth.GET("/user/friends", m.friends)                  // 某个用户的好友
 		auth.GET("/user/blacklist", m.blacklist)              // 用户黑名单列表
@@ -68,8 +70,44 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		auth.GET("user/online", m.online)                     // 在线设备信息
 		auth.PUT("/user/liftban/:uid/:status", m.liftBanUser) // 解禁或封禁用户
 		auth.POST("/user/updatepassword", m.updatePwd)        // 修改用户密码
+		auth.GET("/user/devices", m.devices)                  // 查看某用户设备列表
 	}
 }
+
+func (m *Manager) devices(c *wkhttp.Context) {
+	err := c.CheckLoginRole()
+	if err != nil {
+		c.ResponseError(err)
+		return
+	}
+	uid := c.Query("uid")
+	if uid == "" {
+		c.ResponseError(errors.New("请求用户uid不能为空"))
+		return
+	}
+	devices, err := m.deviceDB.queryDeviceWithUID(uid)
+	if err != nil {
+		m.Error("查询用户设备列表错误", zap.Error(err))
+		c.ResponseError(errors.New("查询用户设备列表错误"))
+		return
+	}
+	list := make([]*managerDeviceResp, 0)
+	if len(devices) == 0 {
+		c.Response(list)
+		return
+	}
+	for _, device := range devices {
+		list = append(list, &managerDeviceResp{
+			ID:          device.Id,
+			DeviceID:    device.DeviceID,
+			DeviceName:  device.DeviceName,
+			DeviceModel: device.DeviceModel,
+			LastLogin:   util.ToyyyyMMddHHmm(time.Unix(device.LastLogin, 0)),
+		})
+	}
+	c.Response(list)
+}
+
 func (m *Manager) online(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
 	if err != nil {
@@ -153,6 +191,56 @@ func (m *Manager) login(c *wkhttp.Context) {
 		Name:  userInfo.Name,
 		Role:  userInfo.Role,
 	})
+}
+
+// 重置用户密码
+func (m *Manager) resetUserPassword(c *wkhttp.Context) {
+	err := c.CheckLoginRoleIsSuperAdmin()
+	if err != nil {
+		c.ResponseError(err)
+		return
+	}
+
+	type reqRUP struct {
+		NewPassword              string `json:"new_password"`
+		NewPassswordConfirmation string `json:"new_password_confirmation"`
+		Uid                      string `json:"uid"`
+	}
+	var req reqRUP
+	if err := c.BindJSON(&req); err != nil {
+		c.ResponseError(errors.New("请求数据格式有误！"))
+		return
+	}
+	if len(req.NewPassword) < 6 {
+		c.ResponseError(errors.New("密码长度必须大于6位"))
+		return
+	}
+	if req.NewPassword != req.NewPassswordConfirmation {
+		c.ResponseError(errors.New("两次密码不一致！"))
+		return
+	}
+	if req.Uid == "" {
+		c.ResponseError(errors.New("用户uid不能为空！"))
+		return
+	}
+	user, err := m.userDB.QueryByUID(req.Uid)
+	if err != nil {
+		m.Error("查询用户信息错误", zap.Error(err))
+		c.ResponseError(errors.New("查询用户信息错误"))
+		return
+	}
+	if user == nil {
+		c.ResponseError(errors.New("操作用户不存在"))
+		return
+	}
+
+	err = m.userDB.UpdateUsersWithField("password", util.MD5(util.MD5(req.NewPassword)), req.Uid)
+	if err != nil {
+		m.Error("重置用户密码错误", zap.Error(err))
+		c.Response("重置用户密码错误")
+		return
+	}
+	c.ResponseOK()
 }
 
 // 删除管理员用户
@@ -264,9 +352,9 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 		c.ResponseError(errors.New("密码不能为空"))
 		return
 	}
-	user, err := m.db.queryUserWithNameAndRole(req.Name, string(wkhttp.Admin))
+	user, err := m.db.queryUserWithNameAndRole(req.LoginName, string(wkhttp.Admin))
 	if err != nil {
-		m.Error("查询用户是否存在错误", zap.String("username", req.Name))
+		m.Error("查询用户是否存在错误", zap.String("username", req.LoginName))
 		c.ResponseError(errors.New("查询用户是否存在错误"))
 		return
 	}
@@ -345,7 +433,12 @@ func (m *Manager) addUser(c *wkhttp.Context) {
 	if m.ctx.GetConfig().ShortNo.EditOff {
 		shortNumStatus = 1
 	}
-	tx, _ := m.db.session.Begin()
+	tx, err := m.db.session.Begin()
+	if err != nil {
+		m.Error("开启事物错误", zap.Error(err))
+		c.ResponseError(errors.New("开启事物错误"))
+		return
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
@@ -558,6 +651,14 @@ func (m *Manager) friends(c *wkhttp.Context) {
 		c.ResponseError(errors.New("查询用户ID不能为空"))
 		return
 	}
+	sortType := c.Query("sort_type")
+	if sortType == "" {
+		sortType = "1"
+	}
+	sortTypeInt, err := strconv.Atoi(sortType)
+	if err != nil {
+		sortTypeInt = 0
+	}
 	list, err := m.friendDB.QueryFriends(uid)
 	if err != nil {
 		m.Error("查询用户好友错误", zap.String("uid", uid))
@@ -565,13 +666,78 @@ func (m *Manager) friends(c *wkhttp.Context) {
 		return
 	}
 	result := make([]*managerFriendResp, 0)
-	if len(list) > 0 {
+	if len(list) == 0 {
+		c.Response(result)
+		return
+	}
+	if sortTypeInt == 0 {
 		for _, friend := range list {
 			result = append(result, &managerFriendResp{
 				UID:              friend.ToUID,
 				Remark:           friend.Remark,
 				Name:             friend.ToName,
 				RelationshipTime: friend.CreatedAt.String(),
+			})
+		}
+		c.Response(result)
+		return
+	}
+	// 查询最近会话
+	conversations, err := m.ctx.IMSyncUserConversation(uid, 0, 1, "", nil)
+	if err != nil {
+		m.Error("同步离线后的最近会话失败！", zap.Error(err), zap.String("loginUID", uid))
+		c.ResponseError(errors.New("同步离线后的最近会话失败！"))
+		return
+	}
+	if len(conversations) == 0 {
+		for _, friend := range list {
+			result = append(result, &managerFriendResp{
+				UID:              friend.ToUID,
+				Remark:           friend.Remark,
+				Name:             friend.ToName,
+				RelationshipTime: friend.CreatedAt.String(),
+			})
+		}
+		c.Response(result)
+		return
+	}
+	sort.SliceStable(conversations, func(i, j int) bool {
+		return conversations[i].Timestamp > conversations[j].Timestamp
+	})
+	for _, conv := range conversations {
+		if conv.ChannelType != common.ChannelTypePerson.Uint8() {
+			continue
+		}
+		var f *DetailModel
+		for _, friend := range list {
+			if friend.ToUID == conv.ChannelID {
+				f = friend
+				break
+			}
+		}
+		if f != nil {
+			result = append(result, &managerFriendResp{
+				UID:              f.ToUID,
+				Remark:           f.Remark,
+				Name:             f.ToName,
+				RelationshipTime: f.CreatedAt.String(),
+			})
+		}
+	}
+	for _, f := range list {
+		isAdd := true
+		for _, r := range result {
+			if r.UID == f.ToUID {
+				isAdd = false
+				break
+			}
+		}
+		if isAdd {
+			result = append(result, &managerFriendResp{
+				UID:              f.ToUID,
+				Remark:           f.Remark,
+				Name:             f.ToName,
+				RelationshipTime: f.CreatedAt.String(),
 			})
 		}
 	}
@@ -763,6 +929,21 @@ func (m *Manager) updatePwd(c *wkhttp.Context) {
 		c.Response("修改用户密码错误")
 		return
 	}
+	// 清除token缓存
+	oldToken, err := m.ctx.Cache().Get(fmt.Sprintf("%s%d%s", m.ctx.GetConfig().Cache.UIDTokenCachePrefix, config.Web, user.UID))
+	if err != nil {
+		m.Error("获取旧token错误", zap.Error(err))
+		c.ResponseError(errors.New("获取旧token错误"))
+		return
+	}
+	if oldToken != "" {
+		err = m.ctx.Cache().Delete(m.ctx.GetConfig().Cache.TokenCachePrefix + oldToken)
+		if err != nil {
+			m.Error("清除旧token数据错误", zap.Error(err))
+			c.ResponseError(errors.New("清除旧token数据错误"))
+			return
+		}
+	}
 	c.ResponseOK()
 }
 func (r managerAddUserReq) checkAddUserReq() error {
@@ -826,7 +1007,11 @@ func (m *Manager) addSystemFriend(uid string) error {
 		m.Error("查询用户关系失败")
 		return err
 	}
-	tx, _ := m.friendDB.session.Begin()
+	tx, err := m.friendDB.session.Begin()
+	if err != nil {
+		m.Error("开启事物错误", zap.Error(err))
+		return errors.New("开启事物错误")
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
@@ -988,6 +1173,15 @@ type managerDisableUserResp struct {
 	RegisterTime string `json:"register_time"`
 	Phone        string `json:"phone"`
 	ClosureTime  string `json:"closure_time"`
+}
+
+type managerDeviceResp struct {
+	ID          int64  `json:"id"`
+	DeviceID    string `json:"device_id"`    // 设备ID
+	DeviceName  string `json:"device_name"`  // 设备名称
+	DeviceModel string `json:"device_model"` // 设备型号
+	LastLogin   string `json:"last_login"`   // 设备最后一次登录时间
+	Self        int    `json:"self"`         // 是否是本机
 }
 
 type userOnlineResp struct {

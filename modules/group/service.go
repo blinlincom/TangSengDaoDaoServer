@@ -40,7 +40,7 @@ type IService interface {
 	GetMembers(groupNo string) ([]*MemberResp, error)
 	// 获取指定群的指定成员信息
 	GetMember(groupNo, uid string) (*MemberResp, error)
-	// 获取黑明单成员uid集合
+	// 获取黑名单成员uid集合
 	GetBlacklistMemberUIDs(groupNo string) ([]string, error)
 	// 查询管理员成员uid列表（包括创建者）
 	GetMemberUIDsOfManager(groupNo string) ([]string, error)
@@ -64,6 +64,8 @@ type IService interface {
 	AddMember(model *AddMemberReq) error
 	// 获取指定一批群的指定成员信息
 	GetMembersWithUIDAndGroupIds(uid string, groupNos []string) ([]*MemberResp, error)
+	// 查询一批群的管理员及群主
+	GetManagersWithGroupNos(groupNos []string) ([]*MemberResp, error)
 }
 
 // Service Service
@@ -84,6 +86,27 @@ func NewService(ctx *config.Context) IService {
 		Log:       log.NewTLog("groupService"),
 		settingDB: newSettingDB(ctx),
 	}
+}
+
+// GetManagersWithGroupNos 查询一批群的管理员及群主
+func (s *Service) GetManagersWithGroupNos(groupNos []string) ([]*MemberResp, error) {
+	models, err := s.db.queryManagersWithGroupNos(groupNos)
+	if err != nil {
+		return nil, err
+	}
+	list := make([]*MemberResp, 0)
+	if len(models) > 0 {
+		for _, model := range models {
+			list = append(list, &MemberResp{
+				UID:     model.UID,
+				Name:    model.Name,
+				Role:    model.Role,
+				GroupNo: model.GroupNo,
+				Remark:  model.Remark,
+			})
+		}
+	}
+	return list, nil
 }
 
 // GetAllGroupCount 获取群总数
@@ -416,25 +439,34 @@ func toInfoResp(m *Model) *InfoResp {
 }
 
 type MemberResp struct {
-	GroupNo   string // 群编号
-	UID       string // 成员uid
-	Name      string // 群成员名称
-	Remark    string // 成员备注
-	Role      int    // 成员角色
-	Version   int64
-	Vercode   string //验证码
-	CreatedAt int64  // 注册时间 10位时间戳
+	GroupNo            string // 群编号
+	UID                string // 成员uid
+	Name               string // 群成员名称
+	Remark             string // 成员备注
+	Role               int    // 成员角色
+	Version            int64
+	Vercode            string //验证码
+	InviteUID          string // 邀请人uid
+	CreatedAt          int64  // 注册时间 10位时间戳
+	IsDeleted          int    //是否已删除
+	ForbiddenExpirTime int64  // 禁言时长
+	Status             int    // 成员状态
 }
 
 func newMemberResp(m *MemberDetailModel) *MemberResp {
 	return &MemberResp{
-		GroupNo: m.GroupNo,
-		UID:     m.UID,
-		Name:    m.Name,
-		Remark:  m.Remark,
-		Role:    m.Role,
-		Version: m.Version,
-		Vercode: m.Vercode,
+		GroupNo:            m.GroupNo,
+		UID:                m.UID,
+		Name:               m.Name,
+		Remark:             m.Remark,
+		Role:               m.Role,
+		Version:            m.Version,
+		Vercode:            m.Vercode,
+		InviteUID:          m.InviteUID,
+		IsDeleted:          m.IsDeleted,
+		ForbiddenExpirTime: m.ForbiddenExpirTime,
+		Status:             m.Status,
+		CreatedAt:          time.Time(m.CreatedAt).Unix(),
 	}
 }
 

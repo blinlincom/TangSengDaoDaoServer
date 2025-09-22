@@ -285,7 +285,7 @@ func (d *DB) updateAvatar(avatar string, groupNo string) error {
 // QueryDetailWithGroupNo 查询群详情
 func (d *DB) QueryDetailWithGroupNo(groupNo string, uid string) (*DetailModel, error) {
 	var detailModel *DetailModel
-	_, err := d.session.Select("`group`.*,IFNULL(group_setting.version,0) + `group`.version  version,IFNULL(group_setting.chat_pwd_on,0) chat_pwd_on,IFNULL(group_setting.mute,0) mute,IFNULL(group_setting.top,0) top,IFNULL(group_setting.show_nick,0) show_nick,IFNULL(group_setting.save,0) save,IFNULL(group_setting.revoke_remind,0) revoke_remind,IFNULL(group_setting.revoke_remind,1) revoke_remind,IFNULL(group_setting.join_group_remind,0) join_group_remind,IFNULL(group_setting.screenshot,1) screenshot,IFNULL(group_setting.receipt,1) receipt,IFNULL(group_setting.flame,0) flame,IFNULL(group_setting.flame_second,0) flame_second,IFNULL(group_setting.remark,'') remark").From("`group`").LeftJoin(`group_setting`, "`group`.group_no=group_setting.group_no and group_setting.uid=?").Where("`group`.group_no=?", uid, groupNo).Load(&detailModel)
+	_, err := d.session.Select("`group`.*,IFNULL(group_setting.version,0) + `group`.version  version,IFNULL(group_setting.chat_pwd_on,0) chat_pwd_on,IFNULL(group_setting.mute,0) mute,IFNULL(group_setting.top,0) top,IFNULL(group_setting.show_nick,0) show_nick,IFNULL(group_setting.save,0) save,IFNULL(group_setting.revoke_remind,1) revoke_remind,IFNULL(group_setting.join_group_remind,0) join_group_remind,IFNULL(group_setting.screenshot,1) screenshot,IFNULL(group_setting.receipt,1) receipt,IFNULL(group_setting.flame,0) flame,IFNULL(group_setting.flame_second,0) flame_second,IFNULL(group_setting.remark,'') remark").From("`group`").LeftJoin(`group_setting`, "`group`.group_no=group_setting.group_no and group_setting.uid=?").Where("`group`.group_no=?", uid, groupNo).Load(&detailModel)
 	return detailModel, err
 }
 
@@ -295,7 +295,7 @@ func (d *DB) QueryDetailWithGroupNos(groupNos []string, uid string) ([]*DetailMo
 		return nil, nil
 	}
 	var detailModels []*DetailModel
-	_, err := d.session.Select("`group`.*,IFNULL(group_setting.version,0) + `group`.version  version,IFNULL(group_setting.chat_pwd_on,0) chat_pwd_on,IFNULL(group_setting.mute,0) mute,IFNULL(group_setting.top,0) top,IFNULL(group_setting.show_nick,0) show_nick,IFNULL(group_setting.save,0) save,IFNULL(group_setting.revoke_remind,0) revoke_remind,IFNULL(group_setting.revoke_remind,1) revoke_remind,IFNULL(group_setting.join_group_remind,0) join_group_remind,IFNULL(group_setting.screenshot,1) screenshot,IFNULL(group_setting.receipt,1) receipt,IFNULL(group_setting.flame,0) flame,IFNULL(group_setting.flame_second,0) flame_second,IFNULL(group_setting.remark,'') remark").From("`group`").LeftJoin(`group_setting`, "`group`.group_no=group_setting.group_no and group_setting.uid=?").Where("`group`.group_no in ?", uid, groupNos).Load(&detailModels)
+	_, err := d.session.Select("`group`.*,IFNULL(group_setting.version,0) + `group`.version  version,IFNULL(group_setting.chat_pwd_on,0) chat_pwd_on,IFNULL(group_setting.mute,0) mute,IFNULL(group_setting.top,0) top,IFNULL(group_setting.show_nick,0) show_nick,IFNULL(group_setting.save,0) save,IFNULL(group_setting.revoke_remind,1) revoke_remind,IFNULL(group_setting.join_group_remind,0) join_group_remind,IFNULL(group_setting.screenshot,1) screenshot,IFNULL(group_setting.receipt,1) receipt,IFNULL(group_setting.flame,0) flame,IFNULL(group_setting.flame_second,0) flame_second,IFNULL(group_setting.remark,'') remark").From("`group`").LeftJoin(`group_setting`, "`group`.group_no=group_setting.group_no and group_setting.uid=?").Where("`group`.group_no in ?", uid, groupNos).Load(&detailModels)
 	return detailModels, err
 }
 
@@ -360,9 +360,9 @@ func (d *DB) queryMembersWithKeyword(groupNo string, loginUID string, keyword st
 	var details []*MemberDetailModel
 	var builder *dbr.SelectStmt
 	if keyword != "" {
-		builder = d.session.Select("group_member.id,group_member.vercode,group_member.uid,group_member.status,group_member.group_no,group_member.remark,group_member.role,IFNULL(user.name,'') name,IFNULL(user.username,'') username,group_member.is_deleted,group_member.robot,group_member.version,group_member.invite_uid,group_member.forbidden_expir_time,group_member.created_at,group_member.updated_at").From("group_member").LeftJoin("user", "group_member.uid=user.uid").LeftJoin("user_setting", fmt.Sprintf("user_setting.uid='%s' and user_setting.to_uid=group_member.uid", loginUID)).Where("group_member.group_no=? and group_member.is_deleted=0 and (group_member.remark like ? or user.name like ? or user_setting.remark like ?)", groupNo, "%"+keyword+"%", "%"+keyword+"%", "%"+keyword+"%").OrderAsc("group_member.created_at")
+		builder = d.session.Select("group_member.id,group_member.vercode,group_member.uid,group_member.status,group_member.group_no,group_member.remark,group_member.role,IFNULL(user.name,'') name,IFNULL(user.username,'') username,group_member.is_deleted,group_member.robot,group_member.version,group_member.invite_uid,group_member.forbidden_expir_time,group_member.created_at,group_member.updated_at").From("group_member").LeftJoin("user", "group_member.uid=user.uid").LeftJoin("user_setting", fmt.Sprintf("user_setting.uid='%s' and user_setting.to_uid=group_member.uid", loginUID)).Where("group_member.group_no=? and group_member.is_deleted=0 and group_member.status=1 and (group_member.remark like ? or user.name like ? or user_setting.remark like ?)", groupNo, "%"+keyword+"%", "%"+keyword+"%", "%"+keyword+"%").OrderAsc("group_member.created_at")
 	} else {
-		builder = d.session.Select("group_member.id,group_member.vercode,group_member.uid,group_member.status,group_member.group_no,group_member.remark,group_member.role,IFNULL(user.name,'') name,IFNULL(user.username,'') username,group_member.is_deleted,group_member.robot,group_member.version,group_member.invite_uid,group_member.forbidden_expir_time,group_member.created_at,group_member.updated_at").From("group_member").LeftJoin("user", "group_member.uid=user.uid").Where("group_member.group_no=? and group_member.is_deleted=0", groupNo).OrderDesc(fmt.Sprintf("group_member.role=%d", MemberRoleCreator)).OrderDesc(fmt.Sprintf("group_member.role=%d", MemberRoleManager)).OrderAsc("group_member.created_at")
+		builder = d.session.Select("group_member.id,group_member.vercode,group_member.uid,group_member.status,group_member.group_no,group_member.remark,group_member.role,IFNULL(user.name,'') name,IFNULL(user.username,'') username,group_member.is_deleted,group_member.robot,group_member.version,group_member.invite_uid,group_member.forbidden_expir_time,group_member.created_at,group_member.updated_at").From("group_member").LeftJoin("user", "group_member.uid=user.uid").Where("group_member.group_no=? and group_member.is_deleted=0 and group_member.status=1", groupNo).OrderDesc(fmt.Sprintf("group_member.role=%d", MemberRoleCreator)).OrderDesc(fmt.Sprintf("group_member.role=%d", MemberRoleManager)).OrderAsc("group_member.created_at")
 	}
 	var err error
 	_, err = builder.Offset((page - 1) * limit).Limit(limit).Load(&details)
@@ -370,15 +370,21 @@ func (d *DB) queryMembersWithKeyword(groupNo string, loginUID string, keyword st
 	return details, err
 }
 
+func (d *DB) queryManagersWithGroupNos(groupNos []string) ([]*MemberDetailModel, error) {
+	var memberModels []*MemberDetailModel
+	_, err := d.session.Select("group_member.id,group_member.vercode,group_member.uid,group_member.status,group_member.group_no,group_member.remark,group_member.role,IFNULL(user.name,'') name,group_member.is_deleted,group_member.version,group_member.created_at,group_member.updated_at").From("group_member").LeftJoin("user", "group_member.uid=user.uid").Where("group_member.group_no in ? and group_member.is_deleted=0 and group_member.role<>0", groupNos).Load(&memberModels)
+	return memberModels, err
+}
+
 func (d *DB) queryMembersWithGroupNo(groupNo string) ([]*MemberDetailModel, error) {
 	var details []*MemberDetailModel
-	_, err := d.session.Select("group_member.id,group_member.vercode,group_member.uid,group_member.status,group_member.group_no,group_member.remark,group_member.role,IFNULL(user.name,'') name,group_member.is_deleted,group_member.version,group_member.created_at,group_member.updated_at").From("group_member").LeftJoin("user", "group_member.uid=user.uid").Where("group_member.group_no=? and group_member.is_deleted=0", groupNo).Load(&details)
+	_, err := d.session.Select("group_member.id,group_member.vercode,group_member.uid,group_member.status,group_member.group_no,group_member.remark,group_member.role,IFNULL(user.name,'') name,group_member.is_deleted,group_member.version,group_member.forbidden_expir_time,group_member.created_at,group_member.updated_at").From("group_member").LeftJoin("user", "group_member.uid=user.uid").Where("group_member.group_no=? and group_member.is_deleted=0", groupNo).Load(&details)
 	return details, err
 }
 
 func (d *DB) queryMemberWithGroupNoAndUID(groupNo, uid string) (*MemberDetailModel, error) {
 	var detail *MemberDetailModel
-	_, err := d.session.Select("group_member.id,group_member.vercode,group_member.uid,group_member.status,group_member.group_no,group_member.remark,group_member.role,IFNULL(user.name,'') name,group_member.is_deleted,group_member.version,group_member.created_at,group_member.updated_at").From("group_member").LeftJoin("user", "group_member.uid=user.uid").Where("group_member.group_no=? and group_member.uid=? and group_member.is_deleted=0", groupNo, uid).Load(&detail)
+	_, err := d.session.Select("group_member.id,group_member.vercode,group_member.uid,group_member.status,group_member.group_no,group_member.remark,group_member.role,group_member.invite_uid,IFNULL(user.name,'') name,group_member.is_deleted,group_member.version,group_member.forbidden_expir_time,group_member.created_at,group_member.updated_at").From("group_member").LeftJoin("user", "group_member.uid=user.uid").Where("group_member.group_no=? and group_member.uid=? and group_member.is_deleted=0", groupNo, uid).Load(&detail)
 	return detail, err
 }
 func (d *DB) queryBlacklistMemberUIDsWithGroupNo(groupNo string) ([]string, error) {

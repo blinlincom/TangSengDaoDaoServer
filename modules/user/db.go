@@ -122,7 +122,7 @@ func (d *DB) QueryDetailByUIDs(uids []string, loginUID string) ([]*Detail, error
 		return nil, nil
 	}
 	var details []*Detail
-	_, err := d.session.Select("user.*,IFNULL(user_setting.mute,0) mute,IFNULL(user_setting.top,0) top,IFNULL(user_setting.chat_pwd_on,0) chat_pwd_on,IFNULL(user_setting.revoke_remind,0) revoke_remind,IFNULL(user_setting.screenshot,0) screenshot,IFNULL(user_setting.receipt,0) receipt").From("user").LeftJoin("user_setting", "user.uid=user_setting.to_uid and user_setting.uid=?").Where("user.uid in ?", loginUID, uids).Load(&details)
+	_, err := d.session.Select("user.*,IFNULL(user_setting.mute,0) mute,IFNULL(user_setting.top,0) top,IFNULL(user_setting.chat_pwd_on,0) chat_pwd_on,IFNULL(user_setting.revoke_remind,1) revoke_remind,IFNULL(user_setting.screenshot,0) screenshot,IFNULL(user_setting.receipt,0) receipt").From("user").LeftJoin("user_setting", "user.uid=user_setting.to_uid and user_setting.uid=?").Where("user.uid in ?", loginUID, uids).Load(&details)
 	return details, err
 }
 
@@ -151,7 +151,7 @@ func (d *DB) UpdateUsersWithField(field string, value string, uid string) error 
 
 // AddOrRemoveBlacklist 添加黑名单
 func (d *DB) AddOrRemoveBlacklistTx(uid string, touid string, blacklist int, version int64, tx *dbr.Tx) error {
-	_, err := tx.Update("user_setting").Set("blacklist", blacklist).Set("version", version).Where("uid=? and to_uid=?", uid, touid).Exec()
+	_, err := tx.Update("user_setting").Set("blacklist", blacklist).Set("version", version).Set("updated_at", dbr.Expr("Now()")).Where("uid=? and to_uid=?", uid, touid).Exec()
 	return err
 }
 
@@ -238,6 +238,7 @@ func (d *DB) queryWithWXOpenIDAndWxUnionid(wxOpenid, wxUnionid string) (*Model, 
 
 // 通过gitee uid查询用户
 func (d *DB) queryWithGiteeUID(giteeUID string) (*Model, error) {
+
 	var model *Model
 	_, err := d.session.Select("*").From("user").Where("gitee_uid=?", giteeUID).Load(&model)
 	return model, err

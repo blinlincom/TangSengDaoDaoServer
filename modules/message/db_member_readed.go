@@ -1,6 +1,9 @@
 package message
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/db"
 	"github.com/gocraft/dbr/v2"
@@ -18,8 +21,35 @@ func newMemberReadedDB(ctx *config.Context) *memberReadedDB {
 	}
 }
 
-func (m *memberReadedDB) insertOrUpdateTx(model *memberReadedModel, tx *dbr.Tx) error {
-	_, err := m.session.InsertBySql("INSERT INTO member_readed (message_id,clone_no,channel_id,channel_type,uid) VALUES (?,?,?,?,?) ON DUPLICATE KEY UPDATE `message_id`=VALUES(`message_id`),`clone_no`=VALUES(`clone_no`),uid=VALUES(uid)", model.MessageID, model.CloneNo, model.ChannelID, model.ChannelType, model.UID).Exec()
+// 批量插入或更新已读记录
+func (m *memberReadedDB) batchInsertOrUpdateTx(models []*memberReadedModel, tx *dbr.Tx) error {
+	if len(models) == 0 {
+		return nil
+	}
+
+	// 构建批量插入的值和参数
+	valueStrings := make([]string, 0, len(models))
+	valueArgs := make([]interface{}, 0, len(models)*4)
+
+	for _, model := range models {
+		valueStrings = append(valueStrings, "(?, ?, ?, ?)")
+		valueArgs = append(valueArgs,
+			model.MessageID,
+			model.ChannelID,
+			model.ChannelType,
+			model.UID)
+	}
+
+	// 构建完整的 SQL 语句
+	stmt := fmt.Sprintf(`INSERT INTO member_readed 
+        (message_id, channel_id, channel_type, uid) 
+        VALUES %s 
+        ON DUPLICATE KEY UPDATE 
+        message_id=VALUES(message_id)`,
+		strings.Join(valueStrings, ","))
+
+	// 使用 tx.InsertBySql 执行批量插入
+	_, err := tx.InsertBySql(stmt, valueArgs...).Exec()
 	return err
 }
 

@@ -44,6 +44,7 @@ func NewFriend(ctx *config.Context) *Friend {
 	}
 	f.ctx.AddEventListener(event.FriendSure, f.handleFriendSure)
 	f.ctx.AddEventListener(event.FriendDelete, f.handleDeleteFriend)
+	f.ctx.AddEventListener(event.EventUserRegister, f.handleUserRegister)
 	return f
 }
 
@@ -173,7 +174,11 @@ func (f *Friend) delete(c *wkhttp.Context) {
 		return
 	}
 	tx, err := f.ctx.DB().Begin()
-	util.CheckErr(err)
+	if err != nil {
+		f.Error("开启事务失败！", zap.Error(err))
+		c.ResponseError(errors.New("开启事务失败！"))
+		return
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
@@ -325,6 +330,7 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 		c.ResponseError(errors.New("接收好友请求的用户不存在！"))
 		return
 	}
+	verifyVercode := true
 	if req.Vercode == "" {
 		friend, err := f.db.queryWithUID(fromUID, req.ToUID)
 		if err != nil {
@@ -343,14 +349,18 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 			return
 		}
 		req.Vercode = friend.SourceVercode
+		verifyVercode = false
 	}
 
-	//验证code是否有效
-	err = source.CheckRequestAddFriendCode(req.Vercode, fromUID)
-	if err != nil {
-		c.ResponseError(err)
-		return
+	if verifyVercode {
+		//验证code是否有效
+		err = source.CheckRequestAddFriendCode(req.Vercode, fromUID)
+		if err != nil {
+			c.ResponseError(err)
+			return
+		}
 	}
+
 	// 设置token
 	token := util.GenerUUID()
 
@@ -378,7 +388,12 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 		c.ResponseError(errors.New("查询用户通讯录红点信息错误"))
 		return
 	}
-	tx, _ := f.ctx.DB().Begin()
+	tx, err := f.ctx.DB().Begin()
+	if err != nil {
+		f.Error("开启事务失败！", zap.Error(err))
+		c.ResponseError(errors.New("开启事务失败！"))
+		return
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
@@ -401,17 +416,18 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 			return
 		}
 	} else {
-		if apply.Status != 0 {
-			isAddCount = true
-			apply.Status = 0
-			err = f.db.updateApplyTx(apply, tx)
-			if err != nil {
-				tx.Rollback()
-				f.Error("修改好友申请记录错误", zap.String("to_uid", req.ToUID))
-				c.ResponseError(errors.New("修改好友申请记录错误"))
-				return
-			}
+		// if apply.Status != 0 {
+		isAddCount = true
+		apply.Status = 0
+		apply.Token = token
+		err = f.db.updateApplyTx(apply, tx)
+		if err != nil {
+			tx.Rollback()
+			f.Error("修改好友申请记录错误", zap.String("to_uid", req.ToUID))
+			c.ResponseError(errors.New("修改好友申请记录错误"))
+			return
 		}
+		// }
 
 	}
 	// 新增红点
@@ -527,9 +543,7 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 		return
 	}
 	if remark == "" {
-		if applyUser != nil {
-			remark = fmt.Sprintf("我是%s", applyUser.Name)
-		}
+		remark = fmt.Sprintf("我是%s", applyUser.Name)
 	}
 	if strings.TrimSpace(applyUID) == "" || strings.TrimSpace(vercode) == "" {
 		c.ResponseError(errors.New("好友申请无效或已过期！"))
@@ -556,7 +570,12 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 		return
 	}
 	// 添加好友到数据库
-	tx, _ := f.ctx.DB().Begin()
+	tx, err := f.ctx.DB().Begin()
+	if err != nil {
+		f.Error("开启事务失败！", zap.Error(err))
+		c.ResponseError(errors.New("开启事务失败！"))
+		return
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
@@ -583,14 +602,14 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 			SourceVercode: vercode,
 		}, tx)
 		if err != nil {
-			util.CheckErr(tx.Rollback())
+			tx.Rollback()
 			c.ResponseError(errors.New("添加好友失败！"))
 			return
 		}
 	} else {
 		err = f.db.updateRelationshipTx(loginUID, applyUID, 0, 0, vercode, version, tx)
 		if err != nil {
-			util.CheckErr(tx.Rollback())
+			tx.Rollback()
 			c.ResponseError(errors.New("修改好友关系失败"))
 			return
 		}
@@ -599,7 +618,7 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 	loginFriendModel, err := f.db.queryWithUID(applyUID, loginUID)
 	//loginIsFriend, err := f.db.IsFriend(applyUID, loginUID)
 	if err != nil {
-		util.CheckErr(tx.Rollback())
+		tx.Rollback()
 		f.Error("查询被添加者是否是好友失败！", zap.Error(err), zap.String("uid", loginUID), zap.String("toUid", applyUID))
 		c.ResponseError(errors.New("查询被添加者是否是好友失败！"))
 		return
@@ -615,14 +634,14 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 			SourceVercode: vercode,
 		}, tx)
 		if err != nil {
-			util.CheckErr(tx.Rollback())
+			tx.Rollback()
 			c.ResponseError(errors.New("添加好友失败！"))
 			return
 		}
 	} else {
 		err = f.db.updateRelationshipTx(applyUID, loginUID, 0, 0, vercode, version, tx)
 		if err != nil {
-			util.CheckErr(tx.Rollback())
+			tx.Rollback()
 			c.ResponseError(errors.New("修改好友关系失败"))
 			return
 		}
@@ -682,8 +701,12 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 		c.ResponseError(errors.New("发送消息失败！"))
 		return
 	}
+	content := "我们已经是好友了，可以愉快的聊天了！"
+	if f.ctx.GetConfig().Friend.AddedTipsText != "" {
+		content = f.ctx.GetConfig().Friend.AddedTipsText
+	}
 	payload := []byte(util.ToJson(map[string]interface{}{
-		"content": "我们已经是好友了，可以愉快的聊天了！",
+		"content": content,
 		"type":    common.Tip,
 	}))
 

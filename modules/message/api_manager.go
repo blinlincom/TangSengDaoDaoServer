@@ -11,7 +11,9 @@ import (
 	"github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/user"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/common"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
+	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/model"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/log"
+	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/register"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/util"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/wkevent"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/wkhttp"
@@ -143,7 +145,12 @@ func (m *Manager) delete(c *wkhttp.Context) {
 	if req.ChannelType == common.ChannelTypePerson.Uint8() {
 		fakeChannelID = common.GetFakeChannelIDWith(req.ChannelID, req.FromUID)
 	}
-	tx, _ := m.ctx.DB().Begin()
+	tx, err := m.ctx.DB().Begin()
+	if err != nil {
+		m.Error("开启事务失败！", zap.Error(err))
+		c.ResponseError(errors.New("开启事务失败！"))
+		return
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
@@ -206,19 +213,22 @@ func (m *Manager) delete(c *wkhttp.Context) {
 			m.Warn("发送cmd失败！", zap.Error(err))
 		}
 	}
-	eventID, err := m.ctx.EventBegin(&wkevent.Data{
-		Event: event.EventUpdateSearchMessage,
-		Data: &config.UpdateSearchMessageReq{
-			MessageIDs: msgIds,
-			ChannelID:  req.ChannelID,
-		},
-		Type: wkevent.None,
-	}, tx)
-	if err != nil {
-		tx.Rollback()
-		m.Error("开启事件失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事件失败！"))
-		return
+	var eventID int64 = 0
+	if m.ctx.GetConfig().ZincSearch.SearchOn {
+		eventID, err = m.ctx.EventBegin(&wkevent.Data{
+			Event: event.EventUpdateSearchMessage,
+			Data: &config.UpdateSearchMessageReq{
+				MessageIDs: msgIds,
+				ChannelID:  req.ChannelID,
+			},
+			Type: wkevent.None,
+		}, tx)
+		if err != nil {
+			tx.Rollback()
+			m.Error("开启事件失败！", zap.Error(err))
+			c.ResponseError(errors.New("开启事件失败！"))
+			return
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		tx.Rollback()
@@ -226,7 +236,9 @@ func (m *Manager) delete(c *wkhttp.Context) {
 		c.ResponseError(errors.New("提交事务失败！"))
 		return
 	}
-	m.ctx.EventCommit(eventID)
+	if eventID > 0 {
+		m.ctx.EventCommit(eventID)
+	}
 	if req.ChannelType == common.ChannelTypePerson.Uint8() {
 		err = m.ctx.SendCMD(config.MsgCMDReq{
 			NoPersist:   false,
@@ -314,11 +326,9 @@ func (m *Manager) prohibitWords(c *wkhttp.Context) {
 		}
 		count, err = m.managerDB.queryProhibitWordsCount()
 		if err != nil {
-			if err != nil {
-				m.Error(common.ErrData.Error(), zap.Error(err))
-				c.ResponseError(errors.New("查询违禁词总数错误"))
-				return
-			}
+			m.Error(common.ErrData.Error(), zap.Error(err))
+			c.ResponseError(errors.New("查询违禁词总数错误"))
+			return
 		}
 	} else {
 		result, err = m.managerDB.queryProhibitWordsWithContentAndPage(searchKey, uint64(pageIndex), uint64(pageSize))
@@ -330,11 +340,9 @@ func (m *Manager) prohibitWords(c *wkhttp.Context) {
 
 		count, err = m.managerDB.queryProhibitWordsCountWithContent(searchKey)
 		if err != nil {
-			if err != nil {
-				m.Error(common.ErrData.Error(), zap.Error(err))
-				c.ResponseError(errors.New("查询搜索违禁词总数错误"))
-				return
-			}
+			m.Error(common.ErrData.Error(), zap.Error(err))
+			c.ResponseError(errors.New("查询搜索违禁词总数错误"))
+			return
 		}
 	}
 
@@ -430,10 +438,10 @@ func (m *Manager) recordpersonal(c *wkhttp.Context) {
 		return
 	}
 	uids := make([]string, 0)
-	msgIds := make([]int64, 0)
+	msgIds := make([]string, 0)
 	for _, msg := range msgs {
 		uids = append(uids, msg.FromUID)
-		msgIds = append(msgIds, msg.MessageID)
+		msgIds = append(msgIds, strconv.FormatInt(msg.MessageID, 10))
 	}
 	msgExtrs, err := m.managerDB.queryMsgExtrWithMsgIds(msgIds)
 	if err != nil {
@@ -447,6 +455,7 @@ func (m *Manager) recordpersonal(c *wkhttp.Context) {
 		c.ResponseError(errors.New("查询发送者信息错误"))
 		return
 	}
+	ids := make([]int64, 0)
 	for _, msg := range msgs {
 		sendName := ""
 		for _, user := range userList {
@@ -480,6 +489,22 @@ func (m *Manager) recordpersonal(c *wkhttp.Context) {
 				log.Warn("负荷数据不是json格式！", zap.Error(err), zap.String("payload", string(msg.Payload)))
 			}
 		}
+		var deviceDBID int64 = 0
+		if strings.Contains(msg.ClientMsgNo, "_") {
+			tempStrs := strings.Split(msg.ClientMsgNo, "_")
+			if len(tempStrs) > 2 {
+				str := tempStrs[1]
+				if str != "" {
+					deviceDBID, err = strconv.ParseInt(str, 10, 64)
+					if err == nil {
+						ids = append(ids, deviceDBID)
+					} else {
+						deviceDBID = 0
+					}
+				}
+			}
+		}
+		println("消息设备ID", deviceDBID)
 		messageId := strconv.FormatInt(msg.MessageID, 10)
 		list = append(list, &recordVO{
 			MessageID:   messageId,
@@ -491,8 +516,31 @@ func (m *Manager) recordpersonal(c *wkhttp.Context) {
 			CreatedAt:   msg.CreatedAt.String(),
 			EditedAt:    editedAt,
 			Revoke:      revoke,
+			DeviceDBID:  deviceDBID,
 			ReadedCount: readedCount,
 		})
+	}
+	var devices []*model.DeviceResp
+	if len(ids) > 0 {
+		modules := register.GetModules(m.ctx)
+		for _, module := range modules {
+			if module.BussDataSource.GetDevice != nil {
+				devices, _ = module.BussDataSource.GetDevice(ids)
+				break
+			}
+		}
+	}
+	if len(devices) > 0 && len(list) > 0 {
+		for _, device := range devices {
+			for _, msg := range list {
+				if msg.DeviceDBID == device.ID {
+					msg.DeviceID = device.DeviceID
+					msg.DeviceName = device.DeviceName
+					msg.DeviceModel = device.DeviceModel
+					break
+				}
+			}
+		}
 	}
 	c.Response(&recordResp{
 		Count: count,
@@ -526,10 +574,10 @@ func (m *Manager) record(c *wkhttp.Context) {
 		return
 	}
 	uids := make([]string, 0)
-	msgIds := make([]int64, 0)
+	msgIds := make([]string, 0)
 	for _, msg := range msgs {
 		uids = append(uids, msg.FromUID)
-		msgIds = append(msgIds, msg.MessageID)
+		msgIds = append(msgIds, strconv.FormatInt(msg.MessageID, 10))
 	}
 	msgExtrs, err := m.managerDB.queryMsgExtrWithMsgIds(msgIds)
 	if err != nil {
@@ -543,6 +591,7 @@ func (m *Manager) record(c *wkhttp.Context) {
 		c.ResponseError(errors.New("查询发送者信息错误"))
 		return
 	}
+	ids := make([]int64, 0)
 	for _, msg := range msgs {
 		sendName := ""
 		for _, user := range userList {
@@ -576,7 +625,22 @@ func (m *Manager) record(c *wkhttp.Context) {
 				log.Warn("负荷数据不是json格式！", zap.Error(err), zap.String("payload", string(msg.Payload)))
 			}
 		}
-
+		var deviceDBID int64 = 0
+		if strings.Contains(msg.ClientMsgNo, "_") {
+			tempStrs := strings.Split(msg.ClientMsgNo, "_")
+			if len(tempStrs) > 2 {
+				str := tempStrs[1]
+				if str != "" {
+					deviceDBID, err = strconv.ParseInt(str, 10, 64)
+					if err == nil {
+						ids = append(ids, deviceDBID)
+					} else {
+						deviceDBID = 0
+					}
+				}
+			}
+		}
+		println("消息设备ID", deviceDBID)
 		messageId := strconv.FormatInt(msg.MessageID, 10)
 
 		list = append(list, &recordVO{
@@ -590,8 +654,32 @@ func (m *Manager) record(c *wkhttp.Context) {
 			CreatedAt:   msg.CreatedAt.String(),
 			EditedAt:    editedAt,
 			Revoke:      revoke,
+			DeviceDBID:  deviceDBID,
 			ReadedCount: readedCount,
 		})
+	}
+
+	var devices []*model.DeviceResp
+	if len(ids) > 0 {
+		modules := register.GetModules(m.ctx)
+		for _, module := range modules {
+			if module.BussDataSource.GetDevice != nil {
+				devices, _ = module.BussDataSource.GetDevice(ids)
+				break
+			}
+		}
+	}
+	if len(devices) > 0 && len(list) > 0 {
+		for _, device := range devices {
+			for _, msg := range list {
+				if msg.DeviceDBID == device.ID {
+					msg.DeviceID = device.DeviceID
+					msg.DeviceName = device.DeviceName
+					msg.DeviceModel = device.DeviceModel
+					break
+				}
+			}
+		}
 	}
 	c.Response(&recordResp{
 		Count: count,
@@ -829,6 +917,10 @@ type recordVO struct {
 	IsDeleted   int                    `json:"is_deleted"`   // 是否删除
 	ReadedCount int                    `json:"readed_count"` // 已读人数
 	Revoke      int                    `json:"revoke"`       // 是否撤回
+	DeviceDBID  int64                  `json:"device_db_id"` // 设备数据库id
+	DeviceID    string                 `json:"device_id"`    // 设备id
+	DeviceName  string                 `json:"device_name"`  // 设备名称
+	DeviceModel string                 `json:"device_model"` // 设备型号
 	CreatedAt   string                 `json:"created_at"`   // 发送时间
 	EditedAt    int                    `json:"edited_at"`    // 编辑时间
 }

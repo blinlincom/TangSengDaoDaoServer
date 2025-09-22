@@ -25,17 +25,18 @@ const (
 )
 
 func (u *User) thirdAuthcode(c *wkhttp.Context) {
-	authcode := util.GenerUUID()
-	err := u.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", ThirdAuthcodePrefix, authcode), "1", time.Minute*5)
-	if err != nil {
-		u.Error("redis set error", zap.Error(err))
-		c.ResponseError(errors.New("redis set error"))
-		return
-	}
+	c.ResponseError(errors.New("不支持注册，请使用官网上演示账号登录！"))
+	// authcode := util.GenerUUID()
+	// err := u.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", ThirdAuthcodePrefix, authcode), "1", time.Minute*5)
+	// if err != nil {
+	// 	u.Error("redis set error", zap.Error(err))
+	// 	c.ResponseError(errors.New("redis set error"))
+	// 	return
+	// }
 
-	c.Response(gin.H{
-		"authcode": authcode,
-	})
+	// c.Response(gin.H{
+	// 	"authcode": authcode,
+	// })
 }
 
 func (u *User) thirdAuthStatus(c *wkhttp.Context) {
@@ -130,7 +131,7 @@ func (u *User) giteeOAuth(c *wkhttp.Context) {
 
 	var loginResp *loginUserDetailResp
 	if userInfoM != nil { // 存在就登录
-		if userInfo == nil || userInfoM.IsDestroy == 1 {
+		if userInfoM.IsDestroy == 1 {
 			c.ResponseError(errors.New("用户不存在"))
 			return
 		}
@@ -175,17 +176,17 @@ func (u *User) giteeOAuth(c *wkhttp.Context) {
 			}
 		}
 		tx, err := u.ctx.DB().Begin()
+		if err != nil {
+			u.Error("开启事务失败！", zap.Error(err))
+			c.ResponseError(errors.New("开启事务失败！"))
+			return
+		}
 		defer func() {
 			if err := recover(); err != nil {
 				tx.Rollback()
 				panic(err)
 			}
 		}()
-		if err != nil {
-			u.Error("开启事务失败！", zap.Error(err))
-			c.ResponseError(errors.New("开启事务失败！"))
-			return
-		}
 
 		err = u.giteeDB.insertTx(userInfo.toModel(), tx)
 		if err != nil {
@@ -196,7 +197,7 @@ func (u *User) giteeOAuth(c *wkhttp.Context) {
 		}
 		// 发送登录消息
 		publicIP := util.GetClientPublicIP(c.Request)
-		loginResp, err = u.createUserWithRespAndTx(loginSpanCtx, model, publicIP, "", tx, func() error {
+		loginResp, err = u.createUserWithRespAndTx(loginSpanCtx, model, publicIP, nil, tx, func() error {
 			err := tx.Commit()
 			if err != nil {
 				tx.Rollback()

@@ -38,7 +38,6 @@ type Message struct {
 	messageReactionDB   *messageReactionDB
 	userDB              *user.DB
 	messageExtraDB      *messageExtraDB
-	memberChangeDB      *memberChangeDB
 	memberReadedDB      *memberReadedDB
 	channelOffsetDB     *channelOffsetDB
 	deviceOffsetDB      *deviceOffsetDB
@@ -65,7 +64,6 @@ func New(ctx *config.Context) *Message {
 		userDB:              user.NewDB(ctx),
 		messageExtraDB:      newMessageExtraDB(ctx),
 		groupService:        group.NewService(ctx),
-		memberChangeDB:      newMemberChangeDB(ctx),
 		memberReadedDB:      newMemberReadedDB(ctx),
 		conversationExtradb: newConversationExtraDB(ctx),
 		messageReactionDB:   newMessageReactionDB(ctx),
@@ -80,6 +78,7 @@ func New(ctx *config.Context) *Message {
 		channelService:      channel.NewService(ctx),
 	}
 	m.ctx.AddEventListener(event.GroupMemberAdd, m.handleGroupMemberAddEvent)
+	m.ctx.AddEventListener(event.GroupMemberScanJoin, m.handleGroupMemberScanJoinEvent)
 	return m
 }
 
@@ -278,7 +277,12 @@ func (m *Message) messageEdit(c *wkhttp.Context) {
 		return
 	}
 
-	tx, _ := m.db.session.Begin()
+	tx, err := m.db.session.Begin()
+	if err != nil {
+		m.Error("开启事务失败！", zap.Error(err))
+		c.ResponseError(errors.New("开启事务失败！"))
+		return
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
@@ -309,26 +313,32 @@ func (m *Message) messageEdit(c *wkhttp.Context) {
 	msgIds := make([]string, 0)
 	msgIds = append(msgIds, req.MessageID)
 	// 发布编辑事件
-	eventID, err := m.ctx.EventBegin(&wkevent.Data{
-		Event: event.EventUpdateSearchMessage,
-		Data: &config.UpdateSearchMessageReq{
-			MessageIDs: msgIds,
-			ChannelID:  req.ChannelID,
-		},
-		Type: wkevent.None,
-	}, tx)
-	if err != nil {
-		tx.Rollback()
-		m.Error("开启事件失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事件失败！"))
-		return
+	var eventID int64 = 0
+	if m.ctx.GetConfig().ZincSearch.SearchOn {
+		eventID, err = m.ctx.EventBegin(&wkevent.Data{
+			Event: event.EventUpdateSearchMessage,
+			Data: &config.UpdateSearchMessageReq{
+				MessageIDs: msgIds,
+				ChannelID:  req.ChannelID,
+			},
+			Type: wkevent.None,
+		}, tx)
+		if err != nil {
+			tx.Rollback()
+			m.Error("开启事件失败！", zap.Error(err))
+			c.ResponseError(errors.New("开启事件失败！"))
+			return
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		tx.Rollback()
 		c.ResponseErrorf("事务提交失败！", err)
 		return
 	}
-	m.ctx.EventCommit(eventID)
+	if eventID > 0 {
+		m.ctx.EventCommit(eventID)
+	}
+
 	err = m.ctx.SendCMD(config.MsgCMDReq{
 		NoPersist:   true,
 		ChannelID:   req.ChannelID,
@@ -372,7 +382,7 @@ func (m *Message) messageReaded(c *wkhttp.Context) {
 	}
 	messageIDStrs := util.RemoveRepeatedElement(req.MessageIDs)
 
-	messages, err := m.db.queryMessagesWithMessageIDs(fakeChannelID, req.ChannelType, messageIDStrs)
+	messages, err := m.db.queryMessagesWithMessageIDs(fakeChannelID, messageIDStrs)
 	if err != nil {
 		c.ResponseErrorf("查询消息失败！", err)
 		return
@@ -383,7 +393,12 @@ func (m *Message) messageReaded(c *wkhttp.Context) {
 		return
 	}
 
-	tx, _ := m.ctx.DB().Begin()
+	tx, err := m.ctx.DB().Begin()
+	if err != nil {
+		m.Error("开启事务失败！", zap.Error(err))
+		c.ResponseError(errors.New("开启事务失败！"))
+		return
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
@@ -391,20 +406,37 @@ func (m *Message) messageReaded(c *wkhttp.Context) {
 		}
 	}()
 
-	//	fromUIDs := make([]string, 0, len(messages)) // 消息发送者
+	// //	fromUIDs := make([]string, 0, len(messages)) // 消息发送者
+	// for _, message := range messages {
+	// 	//	fromUIDs = append(fromUIDs, message.FromUID)
+	// 	err := m.memberReadedDB.insertOrUpdateTx(&memberReadedModel{
+	// 		MessageID:   message.MessageID,
+	// 		ChannelID:   fakeChannelID,
+	// 		ChannelType: req.ChannelType,
+	// 		UID:         loginUID,
+	// 	}, tx)
+	// 	if err != nil {
+	// 		tx.Rollback()
+	// 		c.ResponseErrorf("添加已读数据失败！", err)
+	// 		return
+	// 	}
+	// }
+	// 构建批量插入的数据
+	readedModels := make([]*memberReadedModel, 0, len(messages))
 	for _, message := range messages {
-		//	fromUIDs = append(fromUIDs, message.FromUID)
-		err := m.memberReadedDB.insertOrUpdateTx(&memberReadedModel{
+		readedModels = append(readedModels, &memberReadedModel{
 			MessageID:   message.MessageID,
 			ChannelID:   fakeChannelID,
 			ChannelType: req.ChannelType,
-			UID:         c.GetLoginUID(),
-		}, tx)
-		if err != nil {
-			tx.Rollback()
-			c.ResponseErrorf("添加已读数据失败！", err)
-			return
-		}
+			UID:         loginUID,
+		})
+	}
+	// 批量插入或更新已读记录
+	err = m.memberReadedDB.batchInsertOrUpdateTx(readedModels, tx)
+	if err != nil {
+		tx.Rollback()
+		c.ResponseErrorf("添加已读数据失败！", err)
+		return
 	}
 	if err := tx.Commit(); err != nil {
 		tx.Rollback()
@@ -412,101 +444,43 @@ func (m *Message) messageReaded(c *wkhttp.Context) {
 		return
 	}
 
-	// var messageReadedCountMap map[int64]int
-	// if req.ChannelType != common.ChannelTypePerson.Uint8() {
-	// 	messageReadedCountMap, err = m.memberReadedDB.queryCountWithMessageIDs(fakeChannelID, req.ChannelType, messageIDStrs)
-	// 	if err != nil {
-	// 		c.ResponseErrorf("获取消息已读数量map失败！", err)
-	// 		return
-	// 	}
-	// }
+	// 异步处理 Redis 缓存
+	go func() {
+		for _, message := range messages {
+			messageIDStr := strconv.FormatInt(message.MessageID, 10)
+			jsonStr, err := json.Marshal(&messageReadedCountModel{
+				MessageIDStr:   messageIDStr,
+				MessageID:      message.MessageID,
+				MessageSeq:     message.MessageSeq,
+				FromUID:        message.FromUID,
+				ChannelID:      fakeChannelID,
+				ChannelType:    req.ChannelType,
+				LoginUID:       loginUID,
+				ReqChannelID:   req.ChannelID,
+				ReqChannelType: req.ChannelType,
+			})
+			if err != nil {
+				m.Error("序列化消息错误", zap.Error(err))
+				continue
+			}
 
-	// tx2, _ := m.ctx.DB().Begin()
-	// defer func() {
-	// 	if err := recover(); err != nil {
-	// 		tx2.RollbackUnlessCommitted()
-	// 		panic(err)
-	// 	}
-	// }()
-
-	for _, message := range messages {
-		messageIDStr := strconv.FormatInt(message.MessageID, 10)
-		jsonStr, err := json.Marshal(&messageReadedCountModel{
-			MessageIDStr:   messageIDStr,
-			MessageID:      message.MessageID,
-			MessageSeq:     message.MessageSeq,
-			FromUID:        message.FromUID,
-			ChannelID:      fakeChannelID,
-			ChannelType:    req.ChannelType,
-			LoginUID:       loginUID,
-			ReqChannelID:   req.ChannelID,
-			ReqChannelType: req.ChannelType,
-		})
-		if err != nil {
-			m.Error("序列化消息错误", zap.Error(err))
-			c.ResponseError(errors.New("序列化消息错误"))
-			return
-		}
-		m.mutex.Lock()
-		err = m.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", CacheReadedCountPrefix, messageIDStr), jsonStr, time.Hour*24*7)
-		if err != nil {
+			m.mutex.Lock()
+			err = m.ctx.GetRedisConn().SetAndExpire(
+				fmt.Sprintf("%s%s", CacheReadedCountPrefix, messageIDStr),
+				jsonStr,
+				time.Hour*24*7,
+			)
 			m.mutex.Unlock()
-			m.Error("添加消息扩展数据到缓存失败！", zap.Error(err), zap.Int64("messageID", message.MessageID), zap.String("channelID", fakeChannelID))
-			c.ResponseError(errors.New("添加消息扩展数据到缓存失败！"))
-			return
+
+			if err != nil {
+				m.Error("添加消息扩展数据到缓存失败！",
+					zap.Error(err),
+					zap.Int64("messageID", message.MessageID),
+					zap.String("channelID", fakeChannelID),
+				)
+			}
 		}
-		m.mutex.Unlock()
-		// version := m.genMessageExtraSeq(fakeChannelID)
-		// count := messageReadedCountMap[message.MessageID]
-		// if req.ChannelType == common.ChannelTypePerson.Uint8() {
-		// 	count = 1
-		// }
-		// err = m.messageExtraDB.insertOrUpdateReadedCountTx(&messageExtraModel{
-		// 	MessageID:   strconv.FormatInt(message.MessageID, 10),
-		// 	MessageSeq:  message.MessageSeq,
-		// 	FromUID:     message.FromUID,
-		// 	ChannelID:   fakeChannelID,
-		// 	ChannelType: req.ChannelType,
-		// 	ReadedCount: count,
-		// 	Version:     version,
-		// }, tx2)
-		// if err != nil {
-		// 	tx2.Rollback()
-		// 	m.Error("添加或更新消息扩展数据失败！", zap.Error(err), zap.Int64("messageID", message.MessageID), zap.String("channelID", fakeChannelID))
-		// 	c.ResponseError(errors.New("添加或更新消息扩展数据失败！"))
-		// 	return
-		// }
-	}
-
-	// if err := tx2.Commit(); err != nil {
-	// 	tx2.Rollback()
-	// 	c.ResponseErrorf("提交事务失败！", err)
-	// 	return
-	// }
-
-	// if req.ChannelType == common.ChannelTypePerson.Uint8() {
-	// 	err = m.ctx.SendCMD(config.MsgCMDReq{
-	// 		NoPersist:   true,
-	// 		ChannelID:   req.ChannelID,
-	// 		ChannelType: req.ChannelType,
-	// 		FromUID:     c.GetLoginUID(),
-	// 		CMD:         common.CMDSyncMessageExtra,
-	// 	})
-	// } else {
-	// 	err = m.ctx.SendCMD(config.MsgCMDReq{
-	// 		NoPersist:   true,
-	// 		ChannelID:   req.ChannelID,
-	// 		ChannelType: req.ChannelType,
-	// 		Subscribers: fromUIDs, // 消息只发送给发送者
-	// 		CMD:         common.CMDSyncMessageExtra,
-	// 	})
-	// }
-
-	// if err != nil {
-	// 	c.ResponseErrorf("发送同步命令失败！", err)
-	// 	return
-	// }
-
+	}()
 	c.ResponseOK()
 
 }
@@ -683,7 +657,6 @@ func (m *Message) syncChannelMessage(c *wkhttp.Context) {
 		c.ResponseError(errors.New("同步频道内的消息失败！"))
 		return
 	}
-	fmt.Println("resp----messages-->", len(resp.Messages))
 	fakeChannelID := req.ChannelID
 	if req.ChannelType == common.ChannelTypePerson.Uint8() { // 如果是群则需要计算群成员是否变化 如果有变化则将群成员加入到克隆表
 		fakeChannelID = common.GetFakeChannelIDWith(req.ChannelID, req.LoginUID)
@@ -1015,7 +988,7 @@ func (m *Message) sync(c *wkhttp.Context) {
 	}
 
 	// 全局扩充数据
-	messageExtras, err := m.messageExtraDB.queryWithMessageIDs(messageIDs, c.GetLoginUID())
+	messageExtras, err := m.messageExtraDB.queryWithMessageIDsAndUID(messageIDs, c.GetLoginUID())
 	if err != nil {
 		log.Error("查询消息扩展字段失败！", zap.Error(err))
 	}
@@ -1171,7 +1144,12 @@ func (m *Message) delete(c *wkhttp.Context) {
 		}
 	}
 
-	tx, _ := m.ctx.DB().Begin()
+	tx, err := m.ctx.DB().Begin()
+	if err != nil {
+		m.Error("开启事务失败！", zap.Error(err))
+		c.ResponseError(errors.New("开启事务失败！"))
+		return
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
@@ -1201,7 +1179,7 @@ func (m *Message) delete(c *wkhttp.Context) {
 		return
 	}
 
-	err := m.ctx.SendCMD(config.MsgCMDReq{
+	err = m.ctx.SendCMD(config.MsgCMDReq{
 		NoPersist:   true,
 		ChannelID:   loginUID,
 		ChannelType: common.ChannelTypePerson.Uint8(),
@@ -1220,7 +1198,8 @@ func (m *Message) delete(c *wkhttp.Context) {
 }
 
 func (m *Message) genMessageExtraSeq(channelID string) int64 {
-	return m.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, channelID))
+	return time.Now().UnixNano() / 1e3
+	// return m.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, channelID))
 }
 func (m *Message) genMessageReactionSeq(channelID string) int64 {
 	return m.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageReactionSeqKey, channelID))
@@ -1228,6 +1207,7 @@ func (m *Message) genMessageReactionSeq(channelID string) int64 {
 
 // 消息偏移
 func (m *Message) offset(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
 	var req struct {
 		ChannelID   string `json:"channel_id"`
 		ChannelType uint8  `json:"channel_type"`
@@ -1273,7 +1253,68 @@ func (m *Message) offset(c *wkhttp.Context) {
 	if err != nil {
 		m.Error("清除最近会话未读数失败！", zap.Error(err), zap.String("uid", c.GetLoginUID()), zap.String("channelID", req.ChannelID), zap.Uint8("channelType", req.ChannelType))
 	}
+	// 清空提醒项
+	reminders, err := m.remindersDB.queryWithUIDAndChannel(loginUID, req.ChannelID, req.ChannelType, req.MessageSeq)
+	if err != nil {
+		m.Error("查询用户提醒项失败！", zap.Error(err))
+		c.ResponseError(errors.New("查询用户提醒项失败！"))
+		return
+	}
+	reminderIds := make([]int64, 0)
+	if len(reminders) > 0 {
+		for _, reminder := range reminders {
+			if reminder.MessageSeq <= req.MessageSeq && reminder.Done == 0 {
+				reminderIds = append(reminderIds, reminder.Id)
+			}
+		}
+	}
 
+	if len(reminderIds) > 0 {
+		tx, err := m.ctx.DB().Begin()
+		if err != nil {
+			m.Error("开启事务失败！", zap.Error(err))
+			c.ResponseError(errors.New("开启事务失败！"))
+			return
+		}
+		defer func() {
+			if err := recover(); err != nil {
+				tx.RollbackUnlessCommitted()
+				panic(err)
+			}
+		}()
+		err = m.remindersDB.insertDonesTx(reminderIds, loginUID, tx)
+		if err != nil {
+			tx.Rollback()
+			m.Error("更新提醒项状态失败！", zap.Error(err))
+			c.ResponseError(errors.New("更新提醒项状态失败！"))
+			return
+		}
+		for _, id := range reminderIds {
+			version := m.ctx.GenSeq(common.RemindersKey)
+			err = m.remindersDB.updateVersionTx(version, id, tx)
+			if err != nil {
+				tx.Rollback()
+				m.Error("更新提醒项版本失败！", zap.Error(err))
+				c.ResponseError(errors.New("更新提醒项版本失败！"))
+				return
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			tx.Rollback()
+			m.Error("提交事务失败！", zap.Error(err))
+			c.ResponseError(errors.New("提交事务失败！"))
+			return
+		}
+		err = m.ctx.SendCMD(config.MsgCMDReq{
+			NoPersist:   true,
+			ChannelID:   req.ChannelID,
+			ChannelType: req.ChannelType,
+			CMD:         common.CMDSyncReminders,
+		})
+		if err != nil {
+			m.Error("发送cmd[CMDSyncReminders]失败！", zap.Error(err))
+		}
+	}
 	// 发送清空红点的命令
 	err = m.ctx.SendCMD(config.MsgCMDReq{
 		NoPersist:   true,
@@ -1302,11 +1343,27 @@ func (m *Message) hasRevokePermission(messageM *messageModel, loginUID string) (
 		return true, nil
 	}
 	if messageM.ChannelType == common.ChannelTypeGroup.Uint8() { // 管理者或创建者可以撤回其他成员的消息
-		creatorOrManager, err := m.groupService.IsCreatorOrManager(messageM.ChannelID, loginUID)
+		loginMember, err := m.groupService.GetMember(messageM.ChannelID, loginUID)
 		if err != nil {
 			return false, err
 		}
-		return creatorOrManager, nil
+		if loginMember == nil {
+			return false, nil
+		}
+		fromMember, err := m.groupService.GetMember(messageM.ChannelID, messageM.FromUID)
+		if err != nil {
+			return false, err
+		}
+		if fromMember == nil && loginMember.Role != int(common.GroupMemberRoleNormal) {
+			return true, nil
+		}
+		if fromMember.Role == int(common.GroupMemberRoleCreater) || loginMember.Role == int(common.GroupMemberRoleNormal) {
+			return false, nil
+		}
+		if loginMember.Role == int(common.GroupMemberRoleCreater) || (loginMember.Role == int(common.GroupMemberRoleManager) && fromMember.Role == int(common.GroupMemberRoleNormal)) {
+			return true, nil
+		}
+
 	}
 
 	return false, nil
@@ -1340,7 +1397,11 @@ func (m *Message) cancelMentionReminderIfNeed(message *messageModel) {
 						}
 					}
 				} else if len(uids) > 0 {
-					tx, _ := m.ctx.DB().Begin()
+					tx, err := m.ctx.DB().Begin()
+					if err != nil {
+						m.Error("开启事务失败！", zap.Error(err))
+						return
+					}
 					defer func() {
 						if err := recover(); err != nil {
 							tx.RollbackUnlessCommitted()
@@ -1361,7 +1422,7 @@ func (m *Message) cancelMentionReminderIfNeed(message *messageModel) {
 						tx.RollbackUnlessCommitted()
 						return
 					}
-					err := m.ctx.SendCMD(config.MsgCMDReq{
+					err = m.ctx.SendCMD(config.MsgCMDReq{
 						NoPersist:   true,
 						Subscribers: uids,
 						CMD:         common.CMDSyncReminders,
@@ -1398,9 +1459,9 @@ func (m *Message) revoke(c *wkhttp.Context) {
 
 	var messageIDs = []string{}
 	var err error
-
+	var messages []*messageModel
 	if clientMsgNo != "" {
-		messages, err := m.db.queryMessagesWithChannelClientMsgNo(fakeChannelID, uint8(channelTypeI), clientMsgNo)
+		messages, err = m.db.queryMessagesWithChannelClientMsgNo(fakeChannelID, uint8(channelTypeI), clientMsgNo)
 		if err != nil {
 			m.Error("撤回失败！", zap.String("fakeChannelID", fakeChannelID), zap.String("clientMsgNo", clientMsgNo), zap.String("loginUID", c.GetLoginUID()))
 			c.ResponseErrorf("查询消息失败！", err)
@@ -1437,8 +1498,19 @@ func (m *Message) revoke(c *wkhttp.Context) {
 	if len(messageIDs) == 0 {
 		messageIDs = append(messageIDs, messageID)
 	}
+	messageExtras, err := m.messageExtraDB.queryWithMessageIDs(messageIDs)
+	if err != nil {
+		m.Error("查询消息扩展错误", zap.Error(err))
+		c.ResponseError(errors.New("查询消息扩展错误"))
+		return
+	}
 
-	tx, _ := m.db.session.Begin()
+	tx, err := m.db.session.Begin()
+	if err != nil {
+		m.Error("开启事务失败！", zap.Error(err))
+		c.ResponseError(errors.New("开启事务失败！"))
+		return
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
@@ -1447,18 +1519,65 @@ func (m *Message) revoke(c *wkhttp.Context) {
 	}()
 	for _, msgID := range messageIDs {
 		version := m.genMessageExtraSeq(fakeChannelID)
-		err = m.messageExtraDB.insertOrUpdateRevokeTx(&messageExtraModel{
-			MessageID:   msgID,
-			ChannelID:   fakeChannelID,
-			ChannelType: uint8(channelTypeI),
-			Revoke:      1,
-			Version:     version,
-			Revoker:     loginUID,
-		}, tx)
-		if err != nil {
-			tx.Rollback()
-			c.ResponseErrorf("更新消息为撤回状态失败！", err)
-			return
+		// err = m.messageExtraDB.insertOrUpdateRevokeTx(&messageExtraModel{
+		// 	MessageID:   msgID,
+		// 	ChannelID:   fakeChannelID,
+		// 	ChannelType: uint8(channelTypeI),
+		// 	Revoke:      1,
+		// 	Version:     version,
+		// 	Revoker:     loginUID,
+		// }, tx)
+		// if err != nil {
+		// 	tx.Rollback()
+		// 	c.ResponseErrorf("更新消息为撤回状态失败！", err)
+		// 	return
+		// }
+		var tempMsgExtra *messageExtraModel
+		for _, messageExtra := range messageExtras {
+			if messageExtra.MessageID == msgID {
+				tempMsgExtra = messageExtra
+				tempMsgExtra.Revoke = 1
+				tempMsgExtra.Revoker = loginUID
+				tempMsgExtra.Version = version
+				break
+			}
+		}
+		if tempMsgExtra != nil {
+			err = m.messageExtraDB.updateTx(tempMsgExtra, tx)
+			if err != nil {
+				tx.Rollback()
+				m.Error("更新消息扩展数据失败！", zap.Error(err), zap.String("messageID", msgID), zap.String("channelID", fakeChannelID))
+				return
+			}
+		} else {
+			fromUID := ""
+			msgSeq := uint32(0)
+			if len(messages) > 0 {
+				for _, msg := range messages {
+					messageIDStr := strconv.FormatInt(msg.MessageID, 10)
+					if messageIDStr == msgID {
+						fromUID = msg.FromUID
+						msgSeq = msg.MessageSeq
+						break
+					}
+				}
+			}
+			err = m.messageExtraDB.insertTx(&messageExtraModel{
+				MessageID:   msgID,
+				MessageSeq:  msgSeq,
+				FromUID:     fromUID,
+				ChannelID:   fakeChannelID,
+				ChannelType: uint8(channelTypeI),
+				ReadedCount: 0,
+				Version:     version,
+				Revoke:      1,
+				Revoker:     loginUID,
+			}, tx)
+			if err != nil {
+				tx.Rollback()
+				m.Error("新增消息扩展数据失败！", zap.Error(err), zap.String("messageID", msgID), zap.String("channelID", fakeChannelID))
+				return
+			}
 		}
 	}
 	msgIds := make([]string, 0)
@@ -1627,13 +1746,56 @@ func newSyncChannelMessageResp(resp *config.SyncChannelMessageResp, loginUID str
 	if len(resp.Messages) > 0 {
 		messageIDs := make([]string, 0, len(resp.Messages))
 		for _, message := range resp.Messages {
+			var payloadMap map[string]interface{}
+			err := util.ReadJsonByByte(message.Payload, &payloadMap)
+			if err != nil {
+				log.Warn("负荷数据不是json格式！", zap.Error(err), zap.String("payload", string(message.Payload)))
+			}
+			if len(payloadMap) > 0 {
+				replyJson := payloadMap["reply"]
+				if replyJson != nil {
+					msgId := replyJson.(map[string]interface{})["message_id"].(string)
+					messageIDs = append(messageIDs, msgId)
+				}
+			}
 			messageIDs = append(messageIDs, fmt.Sprintf("%d", message.MessageID))
 		}
 
 		// 消息全局扩张
-		messageExtras, err := messageExtraDB.queryWithMessageIDs(messageIDs, loginUID)
+		messageExtras, err := messageExtraDB.queryWithMessageIDsAndUID(messageIDs, loginUID)
 		if err != nil {
 			log.Error("查询消息扩展字段失败！", zap.Error(err))
+		}
+		// 修改消息扩展字段
+		for _, message := range resp.Messages {
+			var payloadMap map[string]interface{}
+			err := util.ReadJsonByByte(message.Payload, &payloadMap)
+			if err != nil {
+				log.Warn("负荷数据不是json格式！", zap.Error(err), zap.String("payload", string(message.Payload)))
+			}
+			if len(payloadMap) > 0 {
+				replyJson := payloadMap["reply"]
+				if replyJson == nil {
+					continue
+				}
+				msgId := replyJson.(map[string]interface{})["message_id"].(string)
+				for _, messageExtra := range messageExtras {
+					if messageExtra.MessageID == msgId {
+						var contentEditMap map[string]interface{}
+						if messageExtra.ContentEdit.String != "" {
+							err := util.ReadJsonByByte([]byte(messageExtra.ContentEdit.String), &contentEditMap)
+							if err != nil {
+								log.Warn("负荷数据不是json格式！", zap.Error(err), zap.String("payload", string(messageExtra.ContentEdit.String)))
+								continue
+							}
+							replyJson.(map[string]interface{})["payload"] = contentEditMap
+							payloadMap["reply"] = replyJson
+							message.Payload = []byte(util.ToJson(payloadMap))
+						}
+						break
+					}
+				}
+			}
 		}
 		messageExtraMap := map[string]*messageExtraDetailModel{}
 		if len(messageExtras) > 0 {
@@ -1757,10 +1919,10 @@ type syncReq struct {
 // 	}
 // }
 
-type replyMsgSyncResp struct {
-	Root     *config.MessageResp   `json:"root"`
-	Messages []*config.MessageResp `json:"messages"`
-}
+// type replyMsgSyncResp struct {
+// 	Root     *config.MessageResp   `json:"root"`
+// 	Messages []*config.MessageResp `json:"messages"`
+// }
 
 // MgSyncResp 消息同步请求
 type MsgSyncResp struct {
@@ -1949,13 +2111,13 @@ type reactionSimpleResp struct {
 // 	IsDeleted int    `json:"is_deleted"`
 // }
 
-type syncTotalResp struct {
-	MessageID   string `json:"message_id"`   // 消息唯一ID
-	Seq         string `json:"seq"`          // 回复序列号
-	ChannelID   string `json:"channel_id"`   // 频道唯一ID
-	ChannelType uint8  `json:"channel_type"` // 频道类型
-	Count       int    `json:"count"`        // 回复数量
-}
+// type syncTotalResp struct {
+// 	MessageID   string `json:"message_id"`   // 消息唯一ID
+// 	Seq         string `json:"seq"`          // 回复序列号
+// 	ChannelID   string `json:"channel_id"`   // 频道唯一ID
+// 	ChannelType uint8  `json:"channel_type"` // 频道类型
+// 	Count       int    `json:"count"`        // 回复数量
+// }
 
 type messageExtraResp struct {
 	MessageID       int64                  `json:"message_id"`

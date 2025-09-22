@@ -4,7 +4,7 @@ go 1.20
 
 require (
 	firebase.google.com/go/v4 v4.13.0
-	github.com/TangSengDaoDao/TangSengDaoDaoServerLib v1.0.8-0.20240527133745-a46880f123bb
+	github.com/TangSengDaoDao/TangSengDaoDaoServerLib v1.0.9-0.20250417083430-fee7cd58a990
 	github.com/alibabacloud-go/darabonba-openapi v0.2.1
 	github.com/alibabacloud-go/sms-intl-20180501 v1.0.1
 	github.com/alibabacloud-go/tea v1.2.1
@@ -26,6 +26,7 @@ require (
 	github.com/olivere/elastic v6.2.37+incompatible
 	github.com/opentracing/opentracing-go v1.2.1-0.20220228012449-10b1cf09e00b
 	github.com/pkg/errors v0.9.1
+	github.com/qiniu/go-sdk/v7 v7.19.0
 	github.com/robfig/cron v1.2.0
 	github.com/rubenv/sql-migrate v1.5.2
 	github.com/sendgrid/rest v2.6.9+incompatible
@@ -115,6 +116,7 @@ require (
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/nxadm/tail v1.4.8 // indirect
+	github.com/panjf2000/ants/v2 v2.10.0 // indirect
 	github.com/pelletier/go-toml/v2 v2.0.8 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect

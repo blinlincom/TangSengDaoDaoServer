@@ -1,8 +1,11 @@
 package group
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 
 	"github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/base/event"
@@ -10,7 +13,6 @@ import (
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/common"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/log"
-	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/util"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/wkevent"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/wkhttp"
 	"go.uber.org/zap"
@@ -244,7 +246,17 @@ func (m *Manager) leftbangroup(c *wkhttp.Context) {
 	//通知群成员更新群资料
 	// todo
 	tx, err := m.ctx.DB().Begin()
-	util.CheckErr(err)
+	if err != nil {
+		m.Error("开启事务失败！", zap.Error(err))
+		c.ResponseError(errors.New("开启事务失败！"))
+		return
+	}
+	defer func() {
+		if err := recover(); err != nil {
+			tx.RollbackUnlessCommitted()
+			panic(err)
+		}
+	}()
 	groupMap := make(map[string]string)
 	groupMap["status"] = strconv.Itoa(groupStatus)
 	err = m.db.UpdateTx(group, tx)
@@ -327,7 +339,17 @@ func (m *Manager) forbidden(c *wkhttp.Context) {
 	}
 
 	tx, err := m.ctx.DB().Begin()
-	util.CheckErr(err)
+	if err != nil {
+		m.Error("开启事务失败！", zap.Error(err))
+		c.ResponseError(errors.New("开启事务失败！"))
+		return
+	}
+	defer func() {
+		if err := recover(); err != nil {
+			tx.RollbackUnlessCommitted()
+			panic(err)
+		}
+	}()
 
 	err = m.db.UpdateTx(groupModel, tx)
 	if err != nil {
@@ -375,7 +397,32 @@ func (m *Manager) removeMember(c *wkhttp.Context) {
 		c.ResponseError(err)
 		return
 	}
+	type memberRemoveReq struct {
+		UID []string `json:"uid"` // 成员uid
+	}
+	var req memberRemoveReq
+	if err := c.BindJSON(&req); err != nil {
+		m.Error(common.ErrData.Error(), zap.Error(err))
+		c.ResponseError(common.ErrData)
+		return
+	}
+	if len(req.UID) == 0 {
+		c.ResponseError(errors.New("群成员不能为空！"))
+		return
+	}
+	type deleteReq struct {
+		Members []string `json:"members"` // 成员uid
+	}
+	req2 := &deleteReq{Members: req.UID}
 	c.Request.URL.Path = fmt.Sprintf("/v1/groups/%s/members", c.Param("group_no"))
+
+	jsonData, err := json.Marshal(req2)
+	if err != nil {
+		m.Error("json序列化失败！", zap.Error(err))
+		c.ResponseError(errors.New("json序列化失败！"))
+		return
+	}
+	c.Request.Body = io.NopCloser(bytes.NewReader(jsonData))
 	m.ctx.GetHttpRoute().HandleContext(c)
 }
 

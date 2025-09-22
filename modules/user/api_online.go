@@ -69,7 +69,9 @@ func (u *User) onlinelistWithUIDs(c *wkhttp.Context) {
 // onlineList 查询在线用户 包含我的pc设备
 func (u *User) onlineList(c *wkhttp.Context) {
 	if !u.ctx.GetConfig().OnlineStatusOn {
-		c.Response(make([]string, 0))
+		c.Response(onlineFriendAndDeviceResp{
+			Friends: make([]*config.OnlinestatusResp, 0),
+		})
 		return
 	}
 	loginUID := c.MustGet("uid").(string)
@@ -170,7 +172,11 @@ func (u *User) onlineStatusCheck() {
 	}
 	if len(makeOfflines) > 0 {
 		u.Debug("改变在线状态！", zap.Int("offlineCount", len(makeOfflines)))
-		tx, _ := u.ctx.DB().Begin()
+		tx, err := u.ctx.DB().Begin()
+		if err != nil {
+			u.Error("开启事务失败！", zap.Error(err))
+			return
+		}
 		defer func() {
 			if err := recover(); err != nil {
 				tx.RollbackUnlessCommitted()

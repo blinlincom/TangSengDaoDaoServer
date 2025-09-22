@@ -74,7 +74,6 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 	}
 	groups := r.Group("/v1/groups", g.ctx.AuthMiddleware(r))
 	{
-
 		groups.POST("/:group_no/members", g.memberAdd)                                     // 添加群成员
 		groups.DELETE("/:group_no/members", g.memberRemove)                                // 移除群成员
 		groups.GET("/:group_no/members", g.membersGet)                                     // 获取群成员
@@ -145,7 +144,11 @@ func (g *Group) disband(c *wkhttp.Context) {
 
 	// todo
 	tx, err := g.ctx.DB().Begin()
-	util.CheckErr(err)
+	if err != nil {
+		g.Error("开启事务失败！", zap.Error(err))
+		c.ResponseError(errors.New("开启事务失败！"))
+		return
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
@@ -591,9 +594,13 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 			}
 		}
 	}
-
+	// 事务
 	tx, err := g.ctx.DB().Begin()
-	util.CheckErr(err)
+	if err != nil {
+		g.Error("开启事务失败！", zap.Error(err))
+		c.ResponseError(errors.New("开启事务失败！"))
+		return
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
@@ -802,8 +809,17 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 		}
 	}
 	tx, err := g.ctx.DB().Begin()
-	util.CheckErr(err)
-
+	if err != nil {
+		g.Error("开启事务失败！", zap.Error(err))
+		c.ResponseError(errors.New("开启事务失败！"))
+		return
+	}
+	defer func() {
+		if err := recover(); err != nil {
+			tx.Rollback()
+			panic(err)
+		}
+	}()
 	err = g.db.UpdateTx(group, tx)
 	if err != nil {
 		tx.Rollback()
@@ -905,44 +921,43 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 		return
 	}
 
-	memberCount, err := g.db.QueryMemberCount(groupNo)
-	if err != nil {
-		g.Error("查询群成员数量失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询群成员数量失败！"))
-		return
-	}
-
+	// memberCount, err := g.db.QueryMemberCount(groupNo)
+	// if err != nil {
+	// 	g.Error("查询群成员数量失败！", zap.Error(err))
+	// 	c.ResponseError(errors.New("查询群成员数量失败！"))
+	// 	return
+	// }
 	// 普通群自动升级
-	if memberCount >= int64(g.ctx.GetConfig().GroupUpgradeWhenMemberCount) && group.GroupType == int(GroupTypeCommon) {
+	// if memberCount >= int64(g.ctx.GetConfig().GroupUpgradeWhenMemberCount) && group.GroupType == int(GroupTypeCommon) {
 
-		var ban = 0
-		if group.Status == GroupStatusDisabled {
-			ban = 1
-		}
-		err = g.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
-			ChannelID:   groupNo,
-			ChannelType: common.ChannelTypeGroup.Uint8(),
-			Ban:         ban,
-			Large:       1,
-		})
-		if err != nil {
-			g.Error("更新频道信息失败！", zap.Error(err))
-			c.ResponseError(errors.New("更新频道信息失败！"))
-			return
-		}
+	// 	var ban = 0
+	// 	if group.Status == GroupStatusDisabled {
+	// 		ban = 1
+	// 	}
+	// 	err = g.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
+	// 		ChannelID:   groupNo,
+	// 		ChannelType: common.ChannelTypeGroup.Uint8(),
+	// 		Ban:         ban,
+	// 		Large:       1,
+	// 	})
+	// 	if err != nil {
+	// 		g.Error("更新频道信息失败！", zap.Error(err))
+	// 		c.ResponseError(errors.New("更新频道信息失败！"))
+	// 		return
+	// 	}
 
-		err = g.db.UpdateGroupType(groupNo, GroupTypeSuper)
-		if err != nil {
-			g.Error("修改群为超级群失败！", zap.Error(err), zap.String("groupNo", groupNo))
-			c.ResponseError(errors.New("修改群为超级群失败！"))
-			return
-		}
-		// 发送群升级通知
-		err = g.ctx.SendGroupUpgrade(groupNo)
-		if err != nil {
-			g.Warn("发送群升级通知失败！", zap.Error(err))
-		}
-	}
+	// 	err = g.db.UpdateGroupType(groupNo, GroupTypeSuper)
+	// 	if err != nil {
+	// 		g.Error("修改群为超级群失败！", zap.Error(err), zap.String("groupNo", groupNo))
+	// 		c.ResponseError(errors.New("修改群为超级群失败！"))
+	// 		return
+	// 	}
+	// 	// 发送群升级通知
+	// 	err = g.ctx.SendGroupUpgrade(groupNo)
+	// 	if err != nil {
+	// 		g.Warn("发送群升级通知失败！", zap.Error(err))
+	// 	}
+	// }
 
 	c.ResponseOK()
 
@@ -1175,7 +1190,11 @@ func (g *Group) addMembersTx(members []string, groupNo string, operator, operato
 }
 
 func (g *Group) addMembers(members []string, groupNo string, operator, operatorName string) error {
-	tx, _ := g.ctx.DB().Begin()
+	tx, err := g.ctx.DB().Begin()
+	if err != nil {
+		g.Error("开启事务失败！", zap.Error(err))
+		return errors.New("开启事务失败！")
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
@@ -1253,19 +1272,37 @@ func (g *Group) managerAdd(c *wkhttp.Context) {
 			return
 		}
 	}
-
-	err = g.ctx.SendCMD(config.MsgCMDReq{
-		ChannelID:   groupNo,
-		ChannelType: common.ChannelTypeGroup.Uint8(),
-		CMD:         common.CMDGroupMemberUpdate,
-		Param: map[string]interface{}{
-			"group_no": groupNo,
-		},
-	})
-	if err != nil {
-		g.Error("发送命令消息失败！", zap.Error(err))
-		c.ResponseError(errors.New("发送命令消息失败！"))
-		return
+	if groupModel.GroupType == int(GroupTypeCommon) {
+		err = g.ctx.SendCMD(config.MsgCMDReq{
+			ChannelID:   groupNo,
+			ChannelType: common.ChannelTypeGroup.Uint8(),
+			CMD:         common.CMDGroupMemberUpdate,
+			Param: map[string]interface{}{
+				"group_no": groupNo,
+			},
+		})
+		if err != nil {
+			g.Error("发送命令消息失败！", zap.Error(err))
+			c.ResponseError(errors.New("发送命令消息失败！"))
+			return
+		}
+	} else {
+		for _, uid := range memberUIDs {
+			err = g.ctx.SendCMD(config.MsgCMDReq{
+				ChannelID:   groupNo,
+				ChannelType: common.ChannelTypeGroup.Uint8(),
+				CMD:         common.CMDGroupMemberUpdate,
+				Param: map[string]interface{}{
+					"group_no": groupNo,
+					"uid":      uid,
+				},
+			})
+			if err != nil {
+				g.Error("发送命令消息失败！", zap.Error(err))
+				c.ResponseError(errors.New("发送命令消息失败！"))
+				return
+			}
+		}
 	}
 	c.ResponseOK()
 }
@@ -1325,19 +1362,38 @@ func (g *Group) managerRemove(c *wkhttp.Context) {
 			return
 		}
 	}
+	if groupModel.GroupType == int(GroupTypeCommon) {
 
-	err = g.ctx.SendCMD(config.MsgCMDReq{
-		ChannelID:   groupNo,
-		ChannelType: common.ChannelTypeGroup.Uint8(),
-		CMD:         common.CMDGroupMemberUpdate,
-		Param: map[string]interface{}{
-			"group_no": groupNo,
-		},
-	})
-	if err != nil {
-		g.Error("发送命令消息失败！", zap.Error(err))
-		c.ResponseError(errors.New("发送命令消息失败！"))
-		return
+		err = g.ctx.SendCMD(config.MsgCMDReq{
+			ChannelID:   groupNo,
+			ChannelType: common.ChannelTypeGroup.Uint8(),
+			CMD:         common.CMDGroupMemberUpdate,
+			Param: map[string]interface{}{
+				"group_no": groupNo,
+			},
+		})
+		if err != nil {
+			g.Error("发送命令消息失败！", zap.Error(err))
+			c.ResponseError(errors.New("发送命令消息失败！"))
+			return
+		}
+	} else {
+		for _, uid := range memberUIDs {
+			err = g.ctx.SendCMD(config.MsgCMDReq{
+				ChannelID:   groupNo,
+				ChannelType: common.ChannelTypeGroup.Uint8(),
+				CMD:         common.CMDGroupMemberUpdate,
+				Param: map[string]interface{}{
+					"group_no": groupNo,
+					"uid":      uid,
+				},
+			})
+			if err != nil {
+				g.Error("发送命令消息失败！", zap.Error(err))
+				c.ResponseError(errors.New("发送命令消息失败！"))
+				return
+			}
+		}
 	}
 	c.ResponseOK()
 }
@@ -1384,7 +1440,12 @@ func (g *Group) groupForbidden(c *wkhttp.Context) {
 		return
 	}
 
-	tx, _ := g.ctx.DB().Begin()
+	tx, err := g.ctx.DB().Begin()
+	if err != nil {
+		g.Error("开启事务失败！", zap.Error(err))
+		c.ResponseError(errors.New("开启事务失败！"))
+		return
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
@@ -1503,9 +1564,13 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 		c.ResponseError(errors.New("群编号不能为空"))
 		return
 	}
-	_, err := g.getGroupInfo(groupNo)
+	group, err := g.getGroupInfo(groupNo)
 	if err != nil {
 		c.ResponseError(err)
+		return
+	}
+	if group.Invite == 1 {
+		c.ResponseError(errors.New("群开启了邀请模式，不能直接加入群聊"))
 		return
 	}
 	authInfo, err := g.ctx.GetRedisConn().GetString(fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode))
@@ -1597,7 +1662,12 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 		Vercode:   fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
 	}
 
-	tx, _ := g.db.session.Begin()
+	tx, err := g.db.session.Begin()
+	if err != nil {
+		g.Error("开启事务失败！", zap.Error(err))
+		c.ResponseError(errors.New("开启事务失败！"))
+		return
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
@@ -1772,7 +1842,12 @@ func (g *Group) transferGrouper(c *wkhttp.Context) {
 	/**
 	修改群主为普通成员，修改转让用户为群主
 	**/
-	tx, _ := g.db.session.Begin()
+	tx, err := g.db.session.Begin()
+	if err != nil {
+		g.Error("开启事务失败！", zap.Error(err))
+		c.ResponseError(errors.New("开启事务失败！"))
+		return
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
@@ -1911,6 +1986,7 @@ func (g *Group) memberUpdate(c *wkhttp.Context) {
 		CMD:         common.CMDGroupMemberUpdate,
 		Param: map[string]interface{}{
 			"group_no": groupNo,
+			"uid":      memberUID,
 		},
 	})
 	if err != nil {
@@ -1947,6 +2023,7 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 	}
 	var loginMember *MemberModel
 	// 查询操作者身份
+	// 这里要兼容后台管理系统的删除操作
 	if c.CheckLoginRole() != nil {
 		loginMember, err = g.db.QueryMemberWithUID(operator, groupNo)
 		if err != nil {
@@ -1980,16 +2057,18 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 		c.ResponseError(errors.New("被删除者不在此群内"))
 		return
 	}
-	// 验证权限
-	for _, member := range deleteMembers {
-		if loginMember.Role == int(common.GroupMemberRoleManager) {
-			if member.Role == int(common.GroupMemberRoleManager) {
-				c.ResponseError(errors.New("管理员不能删除管理员"))
-				return
-			}
-			if member.Role == int(common.GroupMemberRoleCreater) {
-				c.ResponseError(errors.New("管理员不能删除群主"))
-				return
+	if loginMember != nil {
+		// 验证权限
+		for _, member := range deleteMembers {
+			if loginMember.Role == int(common.GroupMemberRoleManager) {
+				if member.Role == int(common.GroupMemberRoleManager) {
+					c.ResponseError(errors.New("管理员不能删除管理员"))
+					return
+				}
+				if member.Role == int(common.GroupMemberRoleCreater) {
+					c.ResponseError(errors.New("管理员不能删除群主"))
+					return
+				}
 			}
 		}
 	}
@@ -2037,7 +2116,11 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 	}
 
 	tx, err := g.db.session.Begin()
-	util.CheckErr(err)
+	if err != nil {
+		g.Error("开启事务失败！", zap.Error(err))
+		c.ResponseError(errors.New("开启事务失败！"))
+		return
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
@@ -2318,11 +2401,16 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 
 	tx, err := g.db.session.Begin()
 	if err != nil {
-		tx.Rollback()
-		g.Error("开启数据库事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启数据库事务失败！"))
+		g.Error("开启事务失败！", zap.Error(err))
+		c.ResponseError(errors.New("开启事务失败！"))
 		return
 	}
+	defer func() {
+		if err := recover(); err != nil {
+			tx.RollbackUnlessCommitted()
+			panic(err)
+		}
+	}()
 	eventID, err := g.ctx.EventBegin(&wkevent.Data{
 		Event: event.ConversationDelete,
 		Type:  wkevent.CMD,
@@ -2386,6 +2474,7 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 		CMD:         common.CMDGroupMemberUpdate,
 		Param: map[string]interface{}{
 			"group_no": groupNo,
+			"uid":      loginUID,
 		},
 	})
 	if err != nil {
@@ -2500,19 +2589,39 @@ func (g *Group) blacklist(c *wkhttp.Context) {
 			}
 		}
 	}
-	// 发送群成员更新命令
-	err = g.ctx.SendCMD(config.MsgCMDReq{
-		ChannelID:   groupNo,
-		ChannelType: common.ChannelTypeGroup.Uint8(),
-		CMD:         common.CMDGroupMemberUpdate,
-		Param: map[string]interface{}{
-			"group_no": groupNo,
-		},
-	})
-	if err != nil {
-		g.Error("发送更新群成员消息错误", zap.Error(err))
-		c.ResponseError(errors.New("发送更新群成员消息错误！"))
-		return
+	if group.GroupType == int(GroupTypeCommon) {
+		// 发送群成员更新命令
+		err = g.ctx.SendCMD(config.MsgCMDReq{
+			ChannelID:   groupNo,
+			ChannelType: common.ChannelTypeGroup.Uint8(),
+			CMD:         common.CMDGroupMemberUpdate,
+			Param: map[string]interface{}{
+				"group_no": groupNo,
+			},
+		})
+		if err != nil {
+			g.Error("发送更新群成员消息错误", zap.Error(err))
+			c.ResponseError(errors.New("发送更新群成员消息错误！"))
+			return
+		}
+	} else {
+		for _, uid := range req.Uids {
+			// 发送群成员更新命令
+			err = g.ctx.SendCMD(config.MsgCMDReq{
+				ChannelID:   groupNo,
+				ChannelType: common.ChannelTypeGroup.Uint8(),
+				CMD:         common.CMDGroupMemberUpdate,
+				Param: map[string]interface{}{
+					"group_no": groupNo,
+					"uid":      uid,
+				},
+			})
+			if err != nil {
+				g.Error("发送更新群成员消息错误", zap.Error(err))
+				c.ResponseError(errors.New("发送更新群成员消息错误！"))
+				return
+			}
+		}
 	}
 	c.ResponseOK()
 }
@@ -2664,6 +2773,7 @@ func (g *Group) forbiddenWithGroupMember(c *wkhttp.Context) {
 		CMD:         common.CMDGroupMemberUpdate,
 		Param: map[string]interface{}{
 			"group_no": groupNo,
+			"uid":      req.MemberUID,
 		},
 	})
 	if err != nil {
@@ -2712,6 +2822,7 @@ func (g *Group) CheckForbiddenLoop() {
 				CMD:         common.CMDGroupMemberUpdate,
 				Param: map[string]interface{}{
 					"group_no": model.GroupNo,
+					"uid":      model.UID,
 				},
 			})
 			if err != nil {
